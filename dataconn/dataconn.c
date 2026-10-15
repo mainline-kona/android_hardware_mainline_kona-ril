@@ -12,10 +12,12 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <glib-unix.h>
 #include <libqmi-glib.h>
 #include <libqrtr-glib.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +66,26 @@ static void set_iface_up(const char *ifname) {
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
     if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0) {
         ifr.ifr_flags |= IFF_UP;
-        ioctl(fd, SIOCSIFFLAGS, &ifr);
+        if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0) printf("warning=set %s up: %s\n", ifname, strerror(errno));
+    }
+    close(fd);
+}
+
+static void configure_ipv4(const char *ifname, guint32 addr, guint32 mask, guint32 mtu) {
+    struct ifreq ifr;
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = htonl(addr);
+    if (ioctl(fd, SIOCSIFADDR, &ifr) < 0) printf("warning=set address: %s\n", strerror(errno));
+    sin->sin_addr.s_addr = htonl(mask);
+    if (ioctl(fd, SIOCSIFNETMASK, &ifr) < 0) printf("warning=set netmask: %s\n", strerror(errno));
+    if (mtu) {
+        ifr.ifr_mtu = mtu;
+        if (ioctl(fd, SIOCSIFMTU, &ifr) < 0) printf("warning=set mtu: %s\n", strerror(errno));
     }
     close(fd);
 }
@@ -210,23 +231,26 @@ int main(int argc, char **argv) {
         if (!out || !qmi_message_wds_get_current_settings_output_get_result(out, &error))
             fail("get current settings", error);
 
-        guint32 addr, mask, gw, mtu;
+        guint32 addr, mask = 0xffffffff, gw, dns, mtu = 0;
+        gboolean has_addr;
         printf("ifname=%s\n", ifname);
-        if (qmi_message_wds_get_current_settings_output_get_ipv4_address(out, &addr, NULL)) {
-            int prefix = 32;
-            if (qmi_message_wds_get_current_settings_output_get_ipv4_gateway_subnet_mask(out, &mask, NULL))
-                prefix = __builtin_popcount(mask);
+        has_addr = qmi_message_wds_get_current_settings_output_get_ipv4_address(out, &addr, NULL);
+        if (has_addr) {
+            qmi_message_wds_get_current_settings_output_get_ipv4_gateway_subnet_mask(out, &mask, NULL);
             struct in_addr in4 = {.s_addr = htonl(addr)};
-            printf("address=%s/%d\n", inet_ntoa(in4), prefix);
+            printf("address=%s/%d\n", inet_ntoa(in4), __builtin_popcount(mask));
         }
         if (qmi_message_wds_get_current_settings_output_get_ipv4_gateway_address(out, &gw, NULL))
             print_ipv4("gateway", gw);
-        if (qmi_message_wds_get_current_settings_output_get_primary_ipv4_dns_address(out, &addr, NULL))
-            print_ipv4("dns", addr);
-        if (qmi_message_wds_get_current_settings_output_get_secondary_ipv4_dns_address(out, &addr, NULL))
-            print_ipv4("dns", addr);
+        if (qmi_message_wds_get_current_settings_output_get_primary_ipv4_dns_address(out, &dns, NULL))
+            print_ipv4("dns", dns);
+        if (qmi_message_wds_get_current_settings_output_get_secondary_ipv4_dns_address(out, &dns, NULL))
+            print_ipv4("dns", dns);
         if (qmi_message_wds_get_current_settings_output_get_mtu(out, &mtu, NULL))
             printf("mtu=%u\n", mtu);
+
+        if (has_addr) configure_ipv4(ifname, addr, mask, mtu);
+        set_iface_up(ifname);
     }
 
     printf("ready\n");

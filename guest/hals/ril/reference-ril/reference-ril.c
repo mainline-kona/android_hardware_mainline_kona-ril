@@ -38,6 +38,7 @@
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
 #include <termios.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <net/if.h>
@@ -847,6 +848,124 @@ static const char* getRadioInterfaceName()
     return PPP_TTY_PATH_ETH0;
 }
 
+/*
+ * On a real modem behind IPA the data session is set up over QMI by a helper that holds
+ * it until SIGTERM. One session at a time, reported as cid 1.
+ */
+#define DATACONN_PATH "/vendor/bin/pong-dataconn"
+#define DATACONN_CID 1
+
+static pid_t s_dataconn_pid = -1;
+static char s_dc_type[16], s_dc_ifname[32], s_dc_addr[64], s_dc_gw[64], s_dc_dns[160];
+static int s_dc_mtu;
+
+static int useDataconn(void) {
+    return access(DATACONN_PATH, X_OK) == 0;
+}
+
+static void stopDataconn(void) {
+    if (s_dataconn_pid > 0) {
+        kill(s_dataconn_pid, SIGTERM);
+        waitpid(s_dataconn_pid, NULL, 0);
+    }
+    s_dataconn_pid = -1;
+}
+
+static int dataconnAlive(void) {
+    if (s_dataconn_pid > 0 && waitpid(s_dataconn_pid, NULL, WNOHANG) == s_dataconn_pid) {
+        RLOGE("pong-dataconn exited, data session lost");
+        s_dataconn_pid = -1;
+    }
+    return s_dataconn_pid > 0;
+}
+
+// Returns 0 once the helper reports "ready", filling the s_dc_* settings.
+static int startDataconn(const char *apn, const char *pdp_type) {
+    int fds[2];
+    const char *family = (pdp_type && !strcmp(pdp_type, "IPV6")) ? "ipv6" : "ipv4";
+
+    stopDataconn();
+    if (pipe(fds) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        execl(DATACONN_PATH, DATACONN_PATH, apn ? apn : "", family, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    s_dataconn_pid = pid;
+
+    s_dc_ifname[0] = s_dc_addr[0] = s_dc_gw[0] = s_dc_dns[0] = '\0';
+    s_dc_mtu = 0;
+    strlcpy(s_dc_type, (pdp_type && *pdp_type) ? pdp_type : "IP", sizeof(s_dc_type));
+
+    FILE *out = fdopen(fds[0], "r");
+    char line[256];
+    int ready = 0;
+    while (out && fgets(line, sizeof(line), out)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        RLOGD("pong-dataconn: %s", line);
+        if (!strcmp(line, "ready")) {
+            ready = 1;
+            break;
+        } else if (!strncmp(line, "ifname=", 7)) {
+            strlcpy(s_dc_ifname, line + 7, sizeof(s_dc_ifname));
+        } else if (!strncmp(line, "address=", 8)) {
+            strlcpy(s_dc_addr, line + 8, sizeof(s_dc_addr));
+        } else if (!strncmp(line, "gateway=", 8)) {
+            strlcpy(s_dc_gw, line + 8, sizeof(s_dc_gw));
+        } else if (!strncmp(line, "dns=", 4)) {
+            if (s_dc_dns[0]) strlcat(s_dc_dns, " ", sizeof(s_dc_dns));
+            strlcat(s_dc_dns, line + 4, sizeof(s_dc_dns));
+        } else if (!strncmp(line, "mtu=", 4)) {
+            s_dc_mtu = atoi(line + 4);
+        }
+    }
+    if (out) fclose(out); else close(fds[0]);
+
+    if (!ready) {
+        stopDataconn();
+        return -1;
+    }
+    return 0;
+}
+
+static void fillDataconnResponse(RIL_Data_Call_Response_v11 *r) {
+    r->status = 0;
+    r->suggestedRetryTime = -1;
+    r->cid = DATACONN_CID;
+    r->active = 2;  // link up
+    r->type = s_dc_type;
+    r->ifname = s_dc_ifname;
+    r->addresses = s_dc_addr;
+    r->dnses = s_dc_dns;
+    r->gateways = s_dc_gw;
+    r->pcscf = "";
+    r->mtu = s_dc_mtu;
+}
+
+static void sendDataconnCallList(RIL_Token *t) {
+    RIL_Data_Call_Response_v11 response;
+    int n = dataconnAlive() ? 1 : 0;
+
+    if (n) fillDataconnResponse(&response);
+    if (t != NULL) {
+        RIL_onRequestComplete(*t, RIL_E_SUCCESS, n ? &response : NULL,
+                              n * sizeof(RIL_Data_Call_Response_v11));
+    } else {
+        RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, n ? &response : NULL,
+                                  n * sizeof(RIL_Data_Call_Response_v11));
+    }
+}
+
 static void requestOrSendDataCallList(int cid, RIL_Token *t)
 {
     ATResponse *p_response = NULL;
@@ -856,6 +975,11 @@ static void requestOrSendDataCallList(int cid, RIL_Token *t)
     char *out = NULL;
     char propValue[PROP_VALUE_MAX] = {0};
     const char* radioInterfaceName = getRadioInterfaceName();
+
+    if (useDataconn()) {
+        sendDataconnCallList(t);
+        return;
+    }
 
     err = at_send_command_multiline ("AT+CGACT?", "+CGACT:", &p_response);
     if (err != 0 || p_response->success == 0) {
@@ -2939,6 +3063,26 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
     RLOGD("requesting data connection to APN '%s'", apn);
 
+    if (useDataconn()) {
+        pdp_type = datalen > 6 * sizeof(char *) ? ((const char **)data)[6] : "IP";
+        if (startDataconn(apn, pdp_type) < 0) {
+            RIL_Data_Call_Response_v11 response = {
+                .status = 0xffff /* PDP_FAIL_ERROR_UNSPECIFIED */,
+                .suggestedRetryTime = -1,
+                .cid = -1,
+                .active = 0,
+                .type = "", .ifname = "", .addresses = "", .dnses = "", .gateways = "",
+                .pcscf = "", .mtu = 0,
+            };
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+            return;
+        }
+        RIL_Data_Call_Response_v11 response;
+        fillDataconnResponse(&response);
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+        return;
+    }
+
     fd = open ("/dev/qmi", O_RDWR);
     if (fd >= 0) { /* the device doesn't exist on the emulator */
 
@@ -3063,6 +3207,13 @@ static void requestDeactivateDataCall(void *data, RIL_Token t)
     const char *p_cid = ((const char **)data)[0];
     int cid = p_cid ? atoi(p_cid) : -1;
     RIL_Errno rilErrno = RIL_E_GENERIC_FAILURE;
+
+    if (useDataconn()) {
+        stopDataconn();
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+        sendDataconnCallList(NULL);
+        return;
+    }
     if (cid < 1  || cid > MAX_PDP) {
         RIL_onRequestComplete(t, rilErrno, NULL, 0);
         return;

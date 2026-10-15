@@ -6,11 +6,22 @@
 cc_binary {
     name: "pong-dataconn",
     defaults: [
-        "libqmi_defaults",
         "libqmi_glib_dep_defaults",
         "libqmi_libqmi_glib_dep_defaults",
     ],
     srcs: ["dataconn.c"],
-    header_libs: ["libqmi_top_headers"],
-    shared_libs: ["libqrtr-glib"],
+    cflags: [
+        "-DHAVE_CONFIG_H",
+        "-Wno-deprecated-declarations",
+        "-Wno-unused-parameter",
+    ],
+    header_libs: [
+        "libqmi_config_header",
+        "libqmi_top_headers",
+    ],
+    shared_libs: [
+        "libgio-2.0",
+        "libgobject-2.0",
+        "libqrtr-glib",
+    ],
 }
