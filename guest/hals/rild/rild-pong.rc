@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-# AT commands to the integrated modem over its GLINK DATA1 channel
-service vendor.ril-daemon /vendor/bin/hw/libcuttlefish-rild -l libcuttlefish-ril-2.so -- -d /dev/wwan0at0
+# The first AT port rejects most configuration commands, the second takes them
+service vendor.ril-daemon /vendor/bin/hw/libcuttlefish-rild -l libcuttlefish-ril-2.so -- -d /dev/wwan0at1
     class main
     user radio
     group radio inet misc audio log readproc wakelock
