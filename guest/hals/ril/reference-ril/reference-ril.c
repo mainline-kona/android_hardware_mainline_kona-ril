@@ -5469,11 +5469,35 @@ static void getIccId(char *iccid, int size) {
         return;
     }
     err = at_send_command_numeric("AT+CICCID", &p_response);
+    if (err == 0 && p_response->success != 0) {
+        snprintf(iccid, size, "%s", p_response->p_intermediates->line);
+        goto error;
+    }
+    at_response_free(p_response);
+    p_response = NULL;
+
+    // Real modems don't know AT+CICCID, so read EF_ICCID (2FE2) instead.
+    // Its 10 bytes hold the digits as swapped BCD nibbles, padded with F.
+    err = at_send_command_singleline("AT+CRSM=176,12258,0,0,10", "+CRSM:", &p_response);
     if (err < 0 || p_response->success == 0) {
         goto error;
     }
-
-    snprintf(iccid, size, "%s", p_response->p_intermediates->line);
+    {
+        char *line = p_response->p_intermediates->line;
+        int sw1, sw2, n = 0;
+        char *hex = NULL;
+        if (at_tok_start(&line) < 0 || at_tok_nextint(&line, &sw1) < 0 ||
+            at_tok_nextint(&line, &sw2) < 0 || at_tok_nextstr(&line, &hex) < 0 ||
+            sw1 != 144 || hex == NULL) {
+            goto error;
+        }
+        for (size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0' && n < size - 1; i += 2) {
+            char lo = hex[i + 1], hi = hex[i];
+            if (lo != 'F' && lo != 'f' && n < size - 1) iccid[n++] = lo;
+            if (hi != 'F' && hi != 'f' && n < size - 1) iccid[n++] = hi;
+        }
+        iccid[n] = '\0';
+    }
 
 error:
     at_response_free(p_response);
