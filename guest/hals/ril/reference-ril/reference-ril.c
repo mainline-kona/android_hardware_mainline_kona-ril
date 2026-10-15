@@ -1424,7 +1424,8 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
     if (countValidCalls) {  // We don't seem to get a "NO CARRIER" message from
                             // smd, so we're forced to poll until the call ends.
 #else
-    if (needRepoll) {
+    // This modem sends no "NO CARRIER" on our port either, so keep polling during calls.
+    if (needRepoll || countValidCalls) {
 #endif
         RIL_requestTimedCallback (sendCallStateChanged, NULL, &TIMEVAL_CALLSTATEPOLL);
     }
