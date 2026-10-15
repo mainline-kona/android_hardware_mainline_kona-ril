@@ -147,12 +147,8 @@ int main(int argc, char **argv) {
                  clientId);
     }
 
-    property_get("ro.boot.modem_simulator_ports", port, "");
-    if (strcmp(port, "") == 0) {
-      // Assume "no-ril" case.
-      goto done;
-    } else {
-      rilLibPath = "libcuttlefish-ril-2.so";
+    if (rilLibPath == NULL) {
+        rilLibPath = "libcuttlefish-ril-2.so";
     }
 
     dlHandle = dlopen(rilLibPath, RTLD_NOW);

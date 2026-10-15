@@ -9,7 +9,3 @@ service vendor.ril-daemon /vendor/bin/hw/libcuttlefish-rild -l libcuttlefish-ril
     user radio
     group radio inet misc audio log readproc wakelock
     capabilities BLOCK_SUSPEND NET_ADMIN NET_RAW
-
-on post-fs
-    chown radio radio /dev/wwan0at0
-    chmod 0660 /dev/wwan0at0

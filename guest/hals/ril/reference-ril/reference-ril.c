@@ -6378,7 +6378,7 @@ mainLoop(void *param __unused)
                 RLOGD("opening qemu_modem_port %d!", fd);
             } else if (s_port > 0) {
                 fd = socket_network_client("localhost", s_port, SOCK_STREAM);
-            } else if (s_modem_simulator_port >= 0) {
+            } else if (s_modem_simulator_port != (uint32_t)-1) {
               fd = socket(AF_VSOCK, SOCK_STREAM, 0);
               if (fd < 0) {
                  RLOGD("Can't create AF_VSOCK socket!");
@@ -6403,6 +6403,11 @@ mainLoop(void *param __unused)
                                          SOCK_STREAM);
             } else if (s_device_path != NULL) {
                 fd = open (s_device_path, O_RDWR);
+                if (fd < 0) {
+                    RLOGD("Can't open %s: %s", s_device_path, strerror(errno));
+                    sleep(1);
+                    continue;
+                }
                 if ( fd >= 0 && !memcmp( s_device_path, "/dev/ttyS", 9 ) ) {
                     /* disable echo on serial ports */
                     struct termios  ios;
@@ -6490,7 +6495,7 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
     }
 
     if (s_port < 0 && s_device_path == NULL && !isInEmulator() &&
-        s_modem_simulator_port < 0) {
+        s_modem_simulator_port == (uint32_t)-1) {
         usage(argv[0]);
         return NULL;
     }
