@@ -1373,11 +1373,9 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
             needRepoll = 1;
         }
 
-        if (p_calls[countValidCalls].state != RIL_CALL_INCOMING
-            && p_calls[countValidCalls].state != RIL_CALL_WAITING
-        ) {
-            needVoicePath = 1;
-        }
+        // The voice graphs must be up before the call connects: the modem configures
+        // them right when it enables its voice session.
+        needVoicePath = 1;
 
         countValidCalls++;
     }
