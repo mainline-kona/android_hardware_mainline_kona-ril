@@ -8,7 +8,8 @@
  *
  * Usage: pong-dataconn <apn> <ipv4|ipv6|ipv4v6>
  * Prints key=value lines (ifname, address, gateway, dns, mtu) and then "ready" once the
- * session is up, or "error=<reason>" and exits non-zero.
+ * session is up, or "error=<reason>" and exits non-zero. Prints "disconnected" and exits
+ * when the modem drops the session.
  */
 
 #include <arpa/inet.h>
@@ -106,6 +107,20 @@ static void print_ipv4(const char *key, guint32 addr) {
 static gboolean on_sigterm(gpointer loop) {
     g_main_loop_quit(loop);
     return G_SOURCE_REMOVE;
+}
+
+static gboolean s_disconnected;
+
+static void on_packet_service_status(QmiClientWds *wds, QmiIndicationWdsPacketServiceStatusOutput *ind,
+                                     gpointer loop) {
+    QmiWdsConnectionStatus status;
+    if (!qmi_indication_wds_packet_service_status_output_get_connection_status(ind, &status, NULL, NULL) ||
+            status != QMI_WDS_CONNECTION_STATUS_DISCONNECTED)
+        return;
+    s_disconnected = TRUE;
+    printf("disconnected\n");
+    fflush(stdout);
+    g_main_loop_quit(loop);
 }
 
 int main(int argc, char **argv) {
@@ -258,9 +273,10 @@ int main(int argc, char **argv) {
 
     g_unix_signal_add(SIGTERM, on_sigterm, w.loop);
     g_unix_signal_add(SIGINT, on_sigterm, w.loop);
+    g_signal_connect(wds, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);
     g_main_loop_run(w.loop);
 
-    {
+    if (!s_disconnected) {
         g_autoptr(QmiMessageWdsStopNetworkInput) in = qmi_message_wds_stop_network_input_new();
         qmi_message_wds_stop_network_input_set_packet_data_handle(in, handle, NULL);
         qmi_client_wds_stop_network(QMI_CLIENT_WDS(wds), in, 10, NULL, on_done, &w);

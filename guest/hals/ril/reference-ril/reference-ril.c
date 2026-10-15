@@ -879,6 +879,24 @@ static int dataconnAlive(void) {
     return s_dataconn_pid > 0;
 }
 
+static void onDataconnExit(void *param __unused) {
+    if (!dataconnAlive()) RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
+}
+
+// The helper exits when the modem drops the session; tell Android so it sets up a new one.
+static void *watchDataconn(void *arg) {
+    FILE *out = arg;
+    char line[256];
+    while (fgets(line, sizeof(line), out)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        RLOGD("pong-dataconn: %s", line);
+    }
+    fclose(out);
+    static const struct timeval delay = {1, 0};
+    RIL_requestTimedCallback(onDataconnExit, NULL, &delay);
+    return NULL;
+}
+
 // Returns 0 once the helper reports "ready", filling the s_dc_* settings.
 static int startDataconn(const char *apn, const char *pdp_type) {
     int fds[2];
@@ -929,12 +947,18 @@ static int startDataconn(const char *apn, const char *pdp_type) {
             s_dc_mtu = atoi(line + 4);
         }
     }
-    if (out) fclose(out); else close(fds[0]);
-
     if (!ready) {
+        if (out) fclose(out); else close(fds[0]);
         stopDataconn();
         return -1;
     }
+
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, watchDataconn, out) != 0) fclose(out);
+    pthread_attr_destroy(&attr);
     return 0;
 }
 
