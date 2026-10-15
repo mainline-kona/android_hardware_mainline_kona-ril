@@ -6,9 +6,9 @@
 /*
  * Runs the DSP managed voice call path for as long as it lives (until SIGTERM).
  *
- * The voice graph sits behind the hostless MultiMedia5 FE; opening and starting it
- * both ways triggers the speaker and handset mic backends, after which audio flows
- * between the modem and the codecs without the host touching any samples.
+ * The voice sub-graphs live in the speaker and handset mic backend graphs, like the
+ * stock ones; keeping a silent stream running on each backend keeps those graphs up,
+ * and audio flows between the modem and the codecs without the host touching it.
  */
 
 #include <signal.h>
@@ -20,7 +20,8 @@
 #include <tinyalsa/asoundlib.h>
 
 #define CARD 0
-#define VOICE_DEVICE 4
+#define KEEPALIVE_RX_DEVICE 1
+#define KEEPALIVE_TX_DEVICE 3
 
 struct control {
     const char *name;
@@ -29,8 +30,8 @@ struct control {
 };
 
 static const struct control kControls[] = {
-    {"TERTIARY_MI2S_RX Audio Mixer MultiMedia5", "1", "0"},
-    {"MultiMedia5 Mixer TX_CODEC_DMA_TX_3", "1", "0"},
+    {"TERTIARY_MI2S_RX Audio Mixer MultiMedia2", "1", "0"},
+    {"MultiMedia4 Mixer TX_CODEC_DMA_TX_3", "1", "0"},
     {"ADC1_MIXER Switch", "1", "0"},
     {"ADC1 Switch", "1", "0"},
     {"TX0 MODE", "ADC_NORMAL", "ADC_INVALID"},
@@ -63,7 +64,7 @@ static void set_controls(struct mixer *mixer, int on) {
     }
 }
 
-static struct pcm *open_voice(unsigned int flags) {
+static struct pcm *open_keepalive(unsigned int flags) {
     struct pcm_config config = {
             .channels = 2,
             .rate = 48000,
@@ -71,7 +72,7 @@ static struct pcm *open_voice(unsigned int flags) {
             .period_count = 4,
             .format = PCM_FORMAT_S16_LE,
     };
-    struct pcm *pcm = pcm_open(CARD, VOICE_DEVICE, flags, &config);
+    struct pcm *pcm = pcm_open(CARD, flags & PCM_IN ? KEEPALIVE_TX_DEVICE : KEEPALIVE_RX_DEVICE, flags, &config);
     if (!pcm || !pcm_is_ready(pcm)) {
         fprintf(stderr, "open %s: %s\n", flags & PCM_IN ? "tx" : "rx", pcm ? pcm_get_error(pcm) : "");
         if (pcm) pcm_close(pcm);
@@ -90,21 +91,31 @@ int main(void) {
     signal(SIGINT, on_signal);
     set_controls(mixer, 1);
 
-    struct pcm *tx = open_voice(PCM_IN);
-    struct pcm *rx = open_voice(PCM_OUT);
-    if (tx && pcm_start(tx) < 0) fprintf(stderr, "start tx: %s\n", pcm_get_error(tx));
-    if (rx) {
-        /* Filling the buffer once starts the stream; the hostless FE never consumes it. */
-        unsigned int bytes = pcm_frames_to_bytes(rx, pcm_get_buffer_size(rx));
-        void *silence = calloc(1, bytes);
-        if (silence && pcm_write(rx, silence, bytes) < 0)
-            fprintf(stderr, "prime rx: %s\n", pcm_get_error(rx));
-        free(silence);
-    }
+    struct pcm *tx = open_keepalive(PCM_IN);
+    struct pcm *rx = open_keepalive(PCM_OUT);
+    unsigned int rx_bytes = rx ? pcm_frames_to_bytes(rx, pcm_get_buffer_size(rx) / 4) : 0;
+    unsigned int tx_bytes = tx ? pcm_frames_to_bytes(tx, pcm_get_buffer_size(tx) / 4) : 0;
+    void *silence = calloc(1, rx_bytes ? rx_bytes : 1);
+    void *discard = malloc(tx_bytes ? tx_bytes : 1);
     printf("voice path %s\n", tx && rx ? "up" : "partial");
     fflush(stdout);
 
+    /* Both streams pace themselves on the hardware, one period at a time. */
+    while (!stop && (rx || tx)) {
+        if (rx && pcm_write(rx, silence, rx_bytes) < 0) {
+            fprintf(stderr, "keepalive rx: %s\n", pcm_get_error(rx));
+            pcm_close(rx);
+            rx = NULL;
+        }
+        if (tx && pcm_read(tx, discard, tx_bytes) < 0) {
+            fprintf(stderr, "keepalive tx: %s\n", pcm_get_error(tx));
+            pcm_close(tx);
+            tx = NULL;
+        }
+    }
     while (!stop) pause();
+    free(silence);
+    free(discard);
 
     if (rx) {
         pcm_stop(rx);

@@ -4964,7 +4964,14 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
         case RIL_REQUEST_GET_IMSI:
             p_response = NULL;
-            err = at_send_command_numeric("AT+CIMI", &p_response);
+            // The SIM stays busy for a few seconds after it reports READY
+            for (int tries = 0; tries < 10; tries++) {
+                at_response_free(p_response);
+                p_response = NULL;
+                err = at_send_command_numeric("AT+CIMI", &p_response);
+                if (err == 0 && p_response->success) break;
+                usleep(500 * 1000);
+            }
 
             if (err < 0 || p_response->success == 0) {
                 RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
@@ -5941,8 +5948,8 @@ static void pollSIMState (void *param __unused)
     ATResponse *p_response;
     int ret;
 
-    if (sState != RADIO_STATE_UNAVAILABLE) {
-        // no longer valid to poll
+    // The SIM answers "SIM busy" for a while after AT+CFUN=1, so keep polling once on
+    if (sState == RADIO_STATE_OFF) {
         return;
     }
 
