@@ -1,0 +1,16 @@
+//
+// Copyright (C) 2026 The PenguinOS Project
+// SPDX-License-Identifier: Apache-2.0
+//
+
+cc_binary {
+    name: "pong-dataconn",
+    defaults: [
+        "libqmi_defaults",
+        "libqmi_glib_dep_defaults",
+        "libqmi_libqmi_glib_dep_defaults",
+    ],
+    srcs: ["dataconn.c"],
+    header_libs: ["libqmi_top_headers"],
+    shared_libs: ["libqrtr-glib"],
+}
