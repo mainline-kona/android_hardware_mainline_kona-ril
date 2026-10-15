@@ -1354,7 +1354,8 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
     ) {
         err = callFromCLCCLine(p_cur->line, p_calls + countValidCalls);
 
-        if (err != 0) {
+        // The modem lists its packet data session as a mode 1 call.
+        if (err != 0 || !p_calls[countValidCalls].isVoice) {
             continue;
         }
 
