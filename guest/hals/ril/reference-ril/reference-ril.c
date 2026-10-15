@@ -1274,6 +1274,34 @@ static void sendCallStateChanged(void *param __unused)
         NULL, 0);
 }
 
+#define VOICECALL_PATH "/vendor/bin/pong-voicecall"
+
+static pid_t s_voicecall_pid = -1;
+
+// The modem only exchanges call audio with the DSP while the voice graph runs.
+static void setVoicePath(int on) {
+    if (s_voicecall_pid > 0 && waitpid(s_voicecall_pid, NULL, WNOHANG) == s_voicecall_pid) {
+        RLOGE("pong-voicecall exited");
+        s_voicecall_pid = -1;
+    }
+    if (on && s_voicecall_pid < 0 && access(VOICECALL_PATH, X_OK) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl(VOICECALL_PATH, VOICECALL_PATH, (char *)NULL);
+            _exit(127);
+        }
+        if (pid > 0) {
+            RLOGD("pong-voicecall started");
+            s_voicecall_pid = pid;
+        }
+    } else if (!on && s_voicecall_pid > 0) {
+        kill(s_voicecall_pid, SIGTERM);
+        waitpid(s_voicecall_pid, NULL, 0);
+        RLOGD("pong-voicecall stopped");
+        s_voicecall_pid = -1;
+    }
+}
+
 static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused, RIL_Token t)
 {
     int err;
@@ -1285,6 +1313,7 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
     RIL_Call **pp_calls;
     int i;
     int needRepoll = 0;
+    int needVoicePath = 0;
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
     int prevIncomingOrWaitingLine;
@@ -1343,6 +1372,12 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
             needRepoll = 1;
         }
 
+        if (p_calls[countValidCalls].state != RIL_CALL_INCOMING
+            && p_calls[countValidCalls].state != RIL_CALL_WAITING
+        ) {
+            needVoicePath = 1;
+        }
+
         countValidCalls++;
     }
 
@@ -1376,6 +1411,8 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
     s_expectAnswer = 0;
     s_repollCallsCount = 0;
 #endif /*WORKAROUND_ERRONEOUS_ANSWER*/
+
+    setVoicePath(needVoicePath);
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, pp_calls,
             countValidCalls * sizeof (RIL_Call *));
