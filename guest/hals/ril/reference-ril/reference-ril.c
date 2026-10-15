@@ -1357,7 +1357,8 @@ static void requestHangup(void *data, size_t datalen __unused, RIL_Token t)
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
-static void requestSignalStrength(void *data __unused, size_t datalen __unused, RIL_Token t)
+// Fills a RIL_SignalStrength_v12-sized int array from +CSQ. Returns 0 on success.
+static int readSignalStrength(int *response, int maxNumOfElements)
 {
     ATResponse *p_response = NULL;
     int err;
@@ -1365,18 +1366,12 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused, 
     int count = 0;
     // Accept a response that is at least v6, and up to v12
     int minNumOfElements=sizeof(RIL_SignalStrength_v6)/sizeof(int);
-    int maxNumOfElements=sizeof(RIL_SignalStrength_v12)/sizeof(int);
-    int response[maxNumOfElements];
 
-    memset(response, 0, sizeof(response));
+    memset(response, 0, maxNumOfElements * sizeof(int));
 
     // TODO(b/206814247): Rename AT+CSQ command.
     err = at_send_command_singleline("AT+CSQ", "+CSQ:", &p_response);
-
-    if (err < 0 || p_response->success == 0) {
-        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-        goto error;
-    }
+    if (err < 0 || p_response->success == 0) goto error;
 
     line = p_response->p_intermediates->line;
 
@@ -1385,18 +1380,77 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused, 
 
     for (count = 0; count < maxNumOfElements; count++) {
         err = at_tok_nextint(&line, &(response[count]));
-        if (err < 0 && count < minNumOfElements) goto error;
+        if (err < 0) break;
     }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+    if (count < minNumOfElements) {
+        // A real modem only gives <rssi>,<ber>; fill GSM, WCDMA and LTE from it
+        RIL_SignalStrength_v12 ss;
+        int rssi, ber, rssi_dbm, rsrp;
+        if (count < 2) goto error;
+        rssi = response[0];
+        ber = response[1];
+        memset(&ss, 0xff, sizeof(ss));
+        ss.GW_SignalStrength.signalStrength = rssi;
+        ss.GW_SignalStrength.bitErrorRate = ber;
+        ss.WCDMA_SignalStrength.signalStrength = rssi;
+        ss.WCDMA_SignalStrength.bitErrorRate = ber;
+        ss.LTE_SignalStrength.signalStrength = rssi;
+        ss.LTE_SignalStrength.rsrp = INT_MAX;
+        ss.LTE_SignalStrength.rsrq = INT_MAX;
+        ss.LTE_SignalStrength.rssnr = INT_MAX;
+        ss.LTE_SignalStrength.cqi = INT_MAX;
+        ss.LTE_SignalStrength.timingAdvance = INT_MAX;
+        if (rssi >= 0 && rssi <= 31) {
+            // RSRP sits roughly 20 dB under the wideband RSSI on a loaded LTE carrier
+            rssi_dbm = -113 + 2 * rssi;
+            rsrp = -(rssi_dbm - 20);
+            if (rsrp < 44) rsrp = 44;
+            if (rsrp > 140) rsrp = 140;
+            ss.LTE_SignalStrength.rsrp = rsrp;
+        }
+        memcpy(response, &ss, sizeof(ss) < maxNumOfElements * sizeof(int)
+                ? sizeof(ss) : maxNumOfElements * sizeof(int));
+    }
 
     at_response_free(p_response);
-    return;
+    return 0;
 
 error:
-    RLOGE("requestSignalStrength must never return an error when radio is on");
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
+    return -1;
+}
+
+static void requestSignalStrength(void *data __unused, size_t datalen __unused, RIL_Token t)
+{
+    int maxNumOfElements=sizeof(RIL_SignalStrength_v12)/sizeof(int);
+    int response[maxNumOfElements];
+
+    if (readSignalStrength(response, maxNumOfElements) < 0) {
+        RLOGE("requestSignalStrength must never return an error when radio is on");
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+}
+
+// A real modem never reports +CSQ on its own, so push it to the framework periodically
+static const struct timeval TIMEVAL_SIGNALPOLL = {10, 0};
+
+static void pollSignalStrength(void *param __unused)
+{
+    int maxNumOfElements=sizeof(RIL_SignalStrength_v12)/sizeof(int);
+    int response[maxNumOfElements];
+
+    if (sState == RADIO_STATE_ON &&
+            readSignalStrength(response, maxNumOfElements) == 0) {
+        RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
+    }
+    static int s_signalPollStarted;
+    if (!s_signalPollStarted) {
+        s_signalPollStarted = 1;
+        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
+    }
 }
 
 /**
@@ -1929,6 +1983,39 @@ static int mapNetworkRegistrationResponse(int in_response) {
 
 #define REG_STATE_LEN 18
 #define REG_DATA_STATE_LEN 14
+// Access technology of the serving cell from +COPS? (3GPP TS 27.007 <AcT>)
+static int getCopsRadioTech(void) {
+    ATResponse *p_response = NULL;
+    int tech = RADIO_TECH_UNKNOWN;
+    int mode, format, act;
+    char *line, *oper;
+
+    if (at_send_command_singleline("AT+COPS?", "+COPS:", &p_response) < 0 ||
+            !p_response->success) {
+        goto done;
+    }
+    line = p_response->p_intermediates->line;
+    if (at_tok_start(&line) < 0 || at_tok_nextint(&line, &mode) < 0 ||
+            !at_tok_hasmore(&line) || at_tok_nextint(&line, &format) < 0 ||
+            at_tok_nextstr(&line, &oper) < 0 || !at_tok_hasmore(&line) ||
+            at_tok_nextint(&line, &act) < 0) {
+        goto done;
+    }
+    switch (act) {
+        case 0: case 1: tech = RADIO_TECH_GSM; break;
+        case 2: tech = RADIO_TECH_UMTS; break;
+        case 3: tech = RADIO_TECH_EDGE; break;
+        case 4: tech = RADIO_TECH_HSDPA; break;
+        case 5: tech = RADIO_TECH_HSUPA; break;
+        case 6: tech = RADIO_TECH_HSPA; break;
+        case 7: case 9: case 13: tech = RADIO_TECH_LTE; break;
+        case 10: case 11: case 12: tech = RADIO_TECH_NR; break;
+    }
+done:
+    at_response_free(p_response);
+    return tech;
+}
+
 static void requestRegistrationState(int request, void *data __unused,
                                         size_t datalen __unused, RIL_Token t)
 {
@@ -1969,6 +2056,27 @@ static void requestRegistrationState(int request, void *data __unused,
 
     if (parseRegistrationState(line, &type, &count, &registration)) goto error;
 
+    // On LTE a real modem leaves +CGREG unregistered and reports the bearer in +CEREG
+    if (request == RIL_REQUEST_DATA_REGISTRATION_STATE && registration[0] != 1 &&
+            registration[0] != 5 && strcmp(cmd, "AT+CEREG?") != 0) {
+        ATResponse *p_eps = NULL;
+        int *eps = NULL, eps_type, eps_count = 3;
+        err = at_send_command_singleline("AT+CEREG?", "+CEREG:", &p_eps);
+        if (err == 0 && p_eps->success) {
+            char *eps_line = p_eps->p_intermediates->line;
+            if (!parseRegistrationState(eps_line, &eps_type, &eps_count, &eps) &&
+                    (eps[0] == 1 || eps[0] == 5)) {
+                free(registration);
+                registration = eps;
+                eps = NULL;
+                type = eps_type;
+                count = eps_count;
+            }
+        }
+        free(eps);
+        at_response_free(p_eps);
+    }
+
     responseStr = malloc(numElements * sizeof(char *));
     if (!responseStr) goto error;
     memset(responseStr, 0, numElements * sizeof(char *));
@@ -2008,6 +2116,9 @@ static void requestRegistrationState(int request, void *data __unused,
         }
         if (count > 3) {
             asprintf(&responseStr[3], "%d", mapNetworkRegistrationResponse(registration[3]));
+        } else if (registration[0] == 1 || registration[0] == 5) {
+            int tech = getCopsRadioTech();
+            if (tech != RADIO_TECH_UNKNOWN) asprintf(&responseStr[3], "%d", tech);
         }
     }
     asprintf(&responseStr[0], "%d", registration[0]);
@@ -5945,6 +6056,8 @@ static void initializeCallback(void *param __unused)
     if (isRadioOn() > 0) {
         setRadioState (RADIO_STATE_ON);
     }
+
+    RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
 }
 
 static void waitForClose()
