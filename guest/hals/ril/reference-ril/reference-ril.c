@@ -1662,6 +1662,10 @@ unsigned getBitmapFromPreferred(int value) {
     return  LTE | GSM | WCDMA;
 }
 
+// The modem picks its RATs itself (NAS mode preference, 5G first); remember what
+// Android allows so it reads it back and keeps NR enabled.
+static int s_allowedNetworkTypes = -1;
+
 static void requestSetPreferredNetworkType(int request, void *data,
                                            size_t datalen __unused, RIL_Token t )
 {
@@ -1672,6 +1676,12 @@ static void requestSetPreferredNetworkType(int request, void *data,
     int current, old;
     int err;
     int32_t preferred;
+
+    if (request != RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE) {
+        s_allowedNetworkTypes = value;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+        return;
+    }
 
     if (request == RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE) {
         preferred = net2pmask[value];
@@ -1720,6 +1730,13 @@ static void requestSetPreferredNetworkType(int request, void *data,
 static void requestGetPreferredNetworkType(int request __unused, void *data __unused,
                                    size_t datalen __unused, RIL_Token t)
 {
+    if (s_allowedNetworkTypes >= 0 &&
+            (request == RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE_BITMAP ||
+             request == RIL_REQUEST_GET_ALLOWED_NETWORK_TYPES_BITMAP)) {
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &s_allowedNetworkTypes, sizeof(s_allowedNetworkTypes));
+        return;
+    }
+
     int preferred;
     unsigned i;
 
@@ -2130,9 +2147,11 @@ static int mapNetworkRegistrationResponse(int in_response) {
         case 16:
             out_response = RADIO_TECH_LTE_CA;  /* LTE_CA */
             break;
+        case 13:  // E-UTRA-NR dual connectivity: NSA, LTE anchor reported with EN-DC
+            out_response = RADIO_TECH_LTE;
+            break;
         case 11:  // NR connected to a 5GCN
         case 12:  // NG-RAN
-        case 13:  // E-UTRA-NR dual connectivity
             out_response = RADIO_TECH_NR;      /* NR */
             break;
         default:
@@ -2143,12 +2162,12 @@ static int mapNetworkRegistrationResponse(int in_response) {
 }
 
 #define REG_STATE_LEN 18
-#define REG_DATA_STATE_LEN 14
+#define REG_DATA_STATE_LEN 15
 // Access technology of the serving cell from +COPS? (3GPP TS 27.007 <AcT>)
-static int getCopsRadioTech(void) {
+static int getCopsRadioTech(int *act_out) {
     ATResponse *p_response = NULL;
     int tech = RADIO_TECH_UNKNOWN;
-    int mode, format, act;
+    int mode, format, act = -1;
     char *line, *oper;
 
     if (at_send_command_singleline("AT+COPS?", "+COPS:", &p_response) < 0 ||
@@ -2173,6 +2192,7 @@ static int getCopsRadioTech(void) {
         case 10: case 11: case 12: tech = RADIO_TECH_NR; break;
     }
 done:
+    if (act_out) *act_out = act;
     at_response_free(p_response);
     return tech;
 }
@@ -2190,6 +2210,7 @@ static void requestRegistrationState(int request, void *data __unused,
     int i = 0, j, numElements = 0;
     int count = 3;
     int type, startfrom;
+    int act = -1;
 
     RLOGD("requestRegistrationState");
     if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
@@ -2276,9 +2297,10 @@ static void requestRegistrationState(int request, void *data __unused,
             asprintf(&responseStr[2], "%x", registration[2]);
         }
         if (count > 3) {
+            act = registration[3];
             asprintf(&responseStr[3], "%d", mapNetworkRegistrationResponse(registration[3]));
         } else if (registration[0] == 1 || registration[0] == 5) {
-            int tech = getCopsRadioTech();
+            int tech = getCopsRadioTech(&act);
             if (tech != RADIO_TECH_UNKNOWN) asprintf(&responseStr[3], "%d", tech);
         }
     }
@@ -2299,6 +2321,9 @@ static void requestRegistrationState(int request, void *data __unused,
         } else {
           asprintf(&responseStr[13], "%03d%03d", s_mcc, s_mnc);
         }
+        // EN-DC available: libril reports it in the E-UTRAN NR indicators
+        if (act < 0 && (registration[0] == 1 || registration[0] == 5)) getCopsRadioTech(&act);
+        asprintf(&responseStr[14], "%d", act == 13);
     } else {  // Voice
         asprintf(&responseStr[15], "%d", s_mcc);
         asprintf(&responseStr[16], "%d", s_mnc);

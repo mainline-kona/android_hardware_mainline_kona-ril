@@ -6719,7 +6719,8 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
             populateResponseInfo_1_6(responseInfo_1_6, serial, responseType, e);
             RegStateResultV1_6 regResponse = {};
             int numStrings = responseLen / sizeof(char *);
-            if ((numStrings != 6) && (numStrings != 11) && (numStrings != 14)) {
+            if ((numStrings != 6) && (numStrings != 11) && (numStrings != 14) &&
+                (numStrings != 15)) {
                 RLOGE("getDataRegistrationStateResponse Invalid response: NULL");
                 if (e == RIL_E_SUCCESS) responseInfo_1_6.error =
                         ::android::hardware::radio::V1_6::RadioError::INVALID_RESPONSE;
@@ -6754,9 +6755,11 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                         eutranInfo.lteVopsInfo.isVopsSupported = false;
                         eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
                     }
-                    eutranInfo.nrIndicators.isEndcAvailable = false;
+                    // pong: string 14 is the EN-DC flag from +COPS/+CEREG AcT 13
+                    bool endc = numStrings > 14 && ATOI_NULL_HANDLED(resp[14]) == 1;
+                    eutranInfo.nrIndicators.isEndcAvailable = endc;
                     eutranInfo.nrIndicators.isDcNrRestricted = false;
-                    eutranInfo.nrIndicators.isEndcAvailable = false;
+                    eutranInfo.nrIndicators.isNrAvailable = endc;
                     regResponse.accessTechnologySpecificInfo.eutranInfo(eutranInfo);
                 }
 
@@ -6771,7 +6774,8 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                    radioService[slotId]->mRadioResponseV1_5 != NULL) {
             RegStateResultV1_5 regResponse = {};
             int numStrings = responseLen / sizeof(char *);
-            if ((numStrings != 6) && (numStrings != 11) && (numStrings != 14)) {
+            if ((numStrings != 6) && (numStrings != 11) && (numStrings != 14) &&
+                (numStrings != 15)) {
                 RLOGE("getDataRegistrationStateResponse Invalid response: NULL");
                 if (e == RIL_E_SUCCESS) responseInfo.error = RadioError::INVALID_RESPONSE;
             } else {
