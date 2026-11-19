@@ -29,7 +29,7 @@ cc_binary {
         "rild_cuttlefish.c",
     ],
     include_dirs: [
-        "device/oneplus/kebab_mainline/radio",
+        "hardware/mainline/kona-ril/guest/hals/ril/reference-libril",
         "hardware/ril/include",
     ],
     shared_libs: [
