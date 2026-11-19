@@ -1,0 +1,16 @@
+//
+// Copyright (C) 2026 The PenguinOS Project
+// SPDX-License-Identifier: Apache-2.0
+//
+
+// QMI data-session helper for the external SDX55; spawned by libcuttlefish-ril-2
+cc_binary {
+    name: "kebab-dataconn",
+    vendor: true,
+    srcs: ["kebab-dataconn.c"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+    ],
+}
