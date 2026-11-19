@@ -852,7 +852,7 @@ static const char* getRadioInterfaceName()
  * On a real modem behind IPA the data session is set up over QMI by a helper that holds
  * it until SIGTERM. One session at a time, reported as cid 1.
  */
-#define DATACONN_PATH "/vendor/bin/pong-dataconn"
+#define DATACONN_PATH "/vendor/bin/kona-dataconn"
 #define DATACONN_CID 1
 
 static pid_t s_dataconn_pid = -1;
@@ -873,7 +873,7 @@ static void stopDataconn(void) {
 
 static int dataconnAlive(void) {
     if (s_dataconn_pid > 0 && waitpid(s_dataconn_pid, NULL, WNOHANG) == s_dataconn_pid) {
-        RLOGE("pong-dataconn exited, data session lost");
+        RLOGE("kona-dataconn exited, data session lost");
         s_dataconn_pid = -1;
     }
     return s_dataconn_pid > 0;
@@ -889,7 +889,7 @@ static void *watchDataconn(void *arg) {
     char line[256];
     while (fgets(line, sizeof(line), out)) {
         line[strcspn(line, "\r\n")] = '\0';
-        RLOGD("pong-dataconn: %s", line);
+        RLOGD("kona-dataconn: %s", line);
     }
     fclose(out);
     static const struct timeval delay = {1, 0};
@@ -930,7 +930,7 @@ static int startDataconn(const char *apn, const char *pdp_type) {
     int ready = 0;
     while (out && fgets(line, sizeof(line), out)) {
         line[strcspn(line, "\r\n")] = '\0';
-        RLOGD("pong-dataconn: %s", line);
+        RLOGD("kona-dataconn: %s", line);
         if (!strcmp(line, "ready")) {
             ready = 1;
             break;
@@ -1298,14 +1298,14 @@ static void sendCallStateChanged(void *param __unused)
         NULL, 0);
 }
 
-#define VOICECALL_PATH "/vendor/bin/pong-voicecall"
+#define VOICECALL_PATH "/vendor/bin/kona-voicecall"
 
 static pid_t s_voicecall_pid = -1;
 
 // The modem only exchanges call audio with the DSP while the voice graph runs.
 static void setVoicePath(int on) {
     if (s_voicecall_pid > 0 && waitpid(s_voicecall_pid, NULL, WNOHANG) == s_voicecall_pid) {
-        RLOGE("pong-voicecall exited");
+        RLOGE("kona-voicecall exited");
         s_voicecall_pid = -1;
     }
     if (on && s_voicecall_pid < 0 && access(VOICECALL_PATH, X_OK) == 0) {
@@ -1315,13 +1315,13 @@ static void setVoicePath(int on) {
             _exit(127);
         }
         if (pid > 0) {
-            RLOGD("pong-voicecall started");
+            RLOGD("kona-voicecall started");
             s_voicecall_pid = pid;
         }
     } else if (!on && s_voicecall_pid > 0) {
         kill(s_voicecall_pid, SIGTERM);
         waitpid(s_voicecall_pid, NULL, 0);
-        RLOGD("pong-voicecall stopped");
+        RLOGD("kona-voicecall stopped");
         s_voicecall_pid = -1;
     }
 }

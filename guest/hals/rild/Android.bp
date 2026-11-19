@@ -39,6 +39,6 @@ cc_binary {
         "libril-modem-lib",
     ],
     relative_install_path: "hw",
-    init_rc: ["rild-pong.rc"],
-    vintf_fragments: ["radio-pong.xml"],
+    init_rc: ["rild-kona.rc"],
+    vintf_fragments: ["radio-kona.xml"],
 }

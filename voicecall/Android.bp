@@ -4,7 +4,7 @@
 //
 
 cc_binary {
-    name: "pong-voicecall",
+    name: "kona-voicecall",
     vendor: true,
     srcs: ["voicecall.c"],
     shared_libs: ["libtinyalsa"],

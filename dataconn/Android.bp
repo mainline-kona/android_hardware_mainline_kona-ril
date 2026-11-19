@@ -4,7 +4,7 @@
 //
 
 cc_binary {
-    name: "pong-dataconn",
+    name: "kona-dataconn",
     defaults: [
         "libqmi_glib_dep_defaults",
         "libqmi_libqmi_glib_dep_defaults",

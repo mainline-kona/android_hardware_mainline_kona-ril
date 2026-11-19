@@ -6755,7 +6755,7 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                         eutranInfo.lteVopsInfo.isVopsSupported = false;
                         eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
                     }
-                    // pong: string 14 is the EN-DC flag from +COPS/+CEREG AcT 13
+                    // kona: string 14 is the EN-DC flag from +COPS/+CEREG AcT 13
                     bool endc = numStrings > 14 && ATOI_NULL_HANDLED(resp[14]) == 1;
                     eutranInfo.nrIndicators.isEndcAvailable = endc;
                     eutranInfo.nrIndicators.isDcNrRestricted = false;

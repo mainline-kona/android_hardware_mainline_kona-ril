@@ -6,7 +6,7 @@
 /*
  * Brings up one mobile data session on the modem behind IPA and holds it until SIGTERM.
  *
- * Usage: pong-dataconn <apn> <ipv4|ipv6|ipv4v6>
+ * Usage: kona-dataconn <apn> <ipv4|ipv6|ipv4v6>
  * Prints key=value lines (ifname, address, gateway, dns, mtu) and then "ready" once the
  * session is up, or "error=<reason>" and exits non-zero. Prints "disconnected" and exits
  * when the modem drops the session.
