@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-// QMI data-session helper for the external SDX55; spawned by libcuttlefish-ril-2
+// QMI data-session helper for the external SDX55: started by init as the IMS
+// DCM server (vendor.kebab_ims_dcm) and used for manual QMI/DIAG probing.
 cc_binary {
     name: "kebab-dataconn",
     vendor: true,

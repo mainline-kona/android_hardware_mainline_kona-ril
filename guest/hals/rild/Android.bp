@@ -39,6 +39,5 @@ cc_binary {
         "libril-modem-lib",
     ],
     relative_install_path: "hw",
-    init_rc: ["rild-kebab.rc"],
     vintf_fragments: ["radio-kebab.xml"],
 }

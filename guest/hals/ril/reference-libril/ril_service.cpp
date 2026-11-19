@@ -6564,9 +6564,9 @@ int radio_1_6::getVoiceRegistrationStateResponse(int slotId,
                     // rat is NR only for NR SA
                     V1_6::NrVopsInfo nrVopsInfo;
                     nrVopsInfo.vopsSupported =
-                            ::android::hardware::radio::V1_6::VopsIndicator::VOPS_NOT_SUPPORTED;
+                            ::android::hardware::radio::V1_6::VopsIndicator::VOPS_OVER_3GPP;
                     nrVopsInfo.emcSupported =
-                            ::android::hardware::radio::V1_6::EmcIndicator::EMC_NOT_SUPPORTED;
+                            ::android::hardware::radio::V1_6::EmcIndicator::EMC_NR_CONNECTED_TO_5GCN;
                     nrVopsInfo.emfSupported =
                             ::android::hardware::radio::V1_6::EmfIndicator::EMF_NOT_SUPPORTED;
                     regResponse.accessTechnologySpecificInfo.ngranNrVopsInfo(nrVopsInfo);
@@ -6575,8 +6575,8 @@ int radio_1_6::getVoiceRegistrationStateResponse(int slotId,
                     V1_5::RegStateResult::AccessTechnologySpecificInfo::
                         EutranRegistrationInfo eutranInfo;
                     if (rat == RADIO_TECH_LTE || rat == RADIO_TECH_LTE_CA) {
-                        eutranInfo.lteVopsInfo.isVopsSupported = false;
-                        eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
+                        eutranInfo.lteVopsInfo.isVopsSupported = true;
+                        eutranInfo.lteVopsInfo.isEmcBearerSupported = true;
                     }
                     eutranInfo.nrIndicators.isEndcAvailable = false;
                     eutranInfo.nrIndicators.isDcNrRestricted = false;
@@ -6624,8 +6624,8 @@ int radio_1_6::getVoiceRegistrationStateResponse(int slotId,
                         EutranRegistrationInfo eutranInfo;
                     if (rat == RADIO_TECH_LTE || rat == RADIO_TECH_LTE_CA ||
                         rat == RADIO_TECH_NR) {
-                        eutranInfo.lteVopsInfo.isVopsSupported = false;
-                        eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
+                        eutranInfo.lteVopsInfo.isVopsSupported = true;
+                        eutranInfo.lteVopsInfo.isEmcBearerSupported = true;
                     }
                     eutranInfo.nrIndicators.isEndcAvailable = false;
                     eutranInfo.nrIndicators.isDcNrRestricted = false;
@@ -6741,9 +6741,9 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                     // rat is NR only for NR SA
                     V1_6::NrVopsInfo nrVopsInfo;
                     nrVopsInfo.vopsSupported =
-                            ::android::hardware::radio::V1_6::VopsIndicator::VOPS_NOT_SUPPORTED;
+                            ::android::hardware::radio::V1_6::VopsIndicator::VOPS_OVER_3GPP;
                     nrVopsInfo.emcSupported =
-                            ::android::hardware::radio::V1_6::EmcIndicator::EMC_NOT_SUPPORTED;
+                            ::android::hardware::radio::V1_6::EmcIndicator::EMC_NR_CONNECTED_TO_5GCN;
                     nrVopsInfo.emfSupported =
                             ::android::hardware::radio::V1_6::EmfIndicator::EMF_NOT_SUPPORTED;
                     regResponse.accessTechnologySpecificInfo.ngranNrVopsInfo(nrVopsInfo);
@@ -6752,8 +6752,8 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                     V1_5::RegStateResult::AccessTechnologySpecificInfo::
                             EutranRegistrationInfo eutranInfo;
                     if (rat == RADIO_TECH_LTE || rat == RADIO_TECH_LTE_CA) {
-                        eutranInfo.lteVopsInfo.isVopsSupported = false;
-                        eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
+                        eutranInfo.lteVopsInfo.isVopsSupported = true;
+                        eutranInfo.lteVopsInfo.isEmcBearerSupported = true;
                     }
                     // pong: string 14 is the EN-DC flag from +COPS/+CEREG AcT 13
                     bool endc = numStrings > 14 && ATOI_NULL_HANDLED(resp[14]) == 1;
@@ -6793,8 +6793,8 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                         EutranRegistrationInfo eutranInfo;
                 if (rat == RADIO_TECH_LTE || rat == RADIO_TECH_LTE_CA ||
                     rat == RADIO_TECH_NR) {
-                    eutranInfo.lteVopsInfo.isVopsSupported = false;
-                    eutranInfo.lteVopsInfo.isEmcBearerSupported = false;
+                    eutranInfo.lteVopsInfo.isVopsSupported = true;
+                    eutranInfo.lteVopsInfo.isEmcBearerSupported = true;
                 }
                 eutranInfo.nrIndicators.isEndcAvailable = false;
                 eutranInfo.nrIndicators.isDcNrRestricted = false;

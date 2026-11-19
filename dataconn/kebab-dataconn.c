@@ -31,7 +31,14 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_link.h>
 #include <linux/qrtr.h>
+
+#ifndef IFLA_RMNET_MUX_ID
+#define IFLA_RMNET_MUX_ID 1
+#endif
 #ifndef __BIONIC__
 #include <linux/ipv6.h> /* struct in6_ifreq; bionic has it in netinet/in.h */
 #endif
@@ -69,6 +76,8 @@ static uint8_t s_wds_cid, s_wda_cid;
 static volatile sig_atomic_t s_stop;
 static int s_disconnected;
 static int s_abortable; /* SIGTERM cancels the request in flight (Start Network) */
+static int s_qmap;      /* opt-in QMAP pass-through: KEBAB_QMAP=1 */
+static unsigned int s_qmap_mux = 1;
 
 /*
  * QRTR transport. The X55's QMUX port (/dev/wwan0qmi0) never answers CTL, but
@@ -93,9 +102,16 @@ struct msg {
     uint8_t buf[2048];
     size_t len;     /* bytes used */
     size_t tlv_off; /* offset of the SDU's TLV length field */
+    int over;       /* set when a field would overflow buf */
 };
 
-static void put8(struct msg *m, uint8_t v) { m->buf[m->len++] = v; }
+static void put8(struct msg *m, uint8_t v) {
+    if (m->len >= sizeof(m->buf)) {
+        m->over = 1;
+        return;
+    }
+    m->buf[m->len++] = v;
+}
 static void put16(struct msg *m, uint16_t v) { put8(m, v & 0xff); put8(m, v >> 8); }
 
 static uint16_t get16(const uint8_t *p) { return p[0] | (p[1] << 8); }
@@ -103,6 +119,7 @@ static uint32_t get32(const uint8_t *p) { return get16(p) | ((uint32_t)get16(p +
 
 static void msg_init(struct msg *m, uint8_t svc, uint8_t cid, uint16_t msgid, uint16_t *txn_out) {
     m->len = 0;
+    m->over = 0;
     put8(m, 0x01);      /* QMUX interface type */
     put16(m, 0);        /* length, patched in msg_send */
     put8(m, 0x00);      /* control flags: from host */
@@ -124,6 +141,10 @@ static void msg_init(struct msg *m, uint8_t svc, uint8_t cid, uint16_t msgid, ui
 }
 
 static void tlv(struct msg *m, uint8_t type, const void *data, uint16_t len) {
+    if (m->over || m->len + 3 + len > sizeof(m->buf)) {
+        m->over = 1;
+        return;
+    }
     put8(m, type);
     put16(m, len);
     memcpy(m->buf + m->len, data, len);
@@ -145,6 +166,8 @@ struct resp {
     uint16_t result, error;
 };
 
+static void dump_tlvs(const char *what, const struct resp *r);
+
 static const uint8_t *find_tlv(const struct resp *r, uint8_t type, uint16_t *len) {
     size_t off = 0;
     while (off + 3 <= r->tlvs_len) {
@@ -165,7 +188,9 @@ static void handle_indication(uint8_t svc, uint16_t msgid, struct resp *r) {
     if (svc == SVC_WDS && msgid == WDS_PKT_SRVC_STATUS) {
         uint16_t l;
         const uint8_t *v = find_tlv(r, 0x01, &l);
+        if (v && l >= 1) printf("info=wds packet status %u\n", v[0]);
         if (v && l >= 1 && v[0] == 1 /* disconnected */) {
+            dump_tlvs("pkt-status", r);
             s_disconnected = 1;
             const uint8_t *er = find_tlv(r, 0x10, &l);
             if (er && l >= 2) printf("end_reason=%u\n", get16(er));
@@ -250,6 +275,8 @@ static int qrtr_read_msg(struct qclient *c, struct resp *r, int timeout_ms, uint
 }
 
 static int msg_send(struct msg *m) {
+    if (m->over)
+        return -EMSGSIZE;
     uint16_t qmux_len = m->len - 1;
     m->buf[1] = qmux_len & 0xff;
     m->buf[2] = qmux_len >> 8;
@@ -263,6 +290,30 @@ static long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
+
+/* KEBAB_QMI_TRACE=0 disables the frame dumps (set by the RIL from
+ * persist.vendor.radio.qmi_trace, or the service's environment). */
+static int trace_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("KEBAB_QMI_TRACE");
+        on = !e || *e != '0';
+    }
+    return on;
+}
+
+static void dump_frame(const char *what, const uint8_t *p, size_t n) {
+    char line[3 * 16 + 1];
+    if (!trace_on()) return;
+    printf("trace=%s len %zu\n", what, n);
+    for (size_t off = 0; off < n && off < 512; off += 16) {
+        size_t chunk = n - off < 16 ? n - off : 16;
+        for (size_t i = 0; i < chunk; i++) sprintf(line + 3 * i, " %02x", p[off + i]);
+        line[3 * chunk] = 0;
+        printf("trace=  %03zx:%s\n", off, line);
+    }
+    if (n > 512) printf("trace=  ... %zu more bytes\n", n - 512);
 }
 
 /* Send and wait for the matching response. Returns 0 if QMI result is success. */
@@ -279,6 +330,7 @@ static int transact(struct msg *m, uint8_t svc, uint16_t msgid, uint16_t txn, st
         struct sockaddr_qrtr sq = {.sq_family = AF_QIPCRTR, .sq_node = qc->node,
                                    .sq_port = qc->port};
         /* the SDU is the QMUX message minus its 6-byte header */
+        dump_frame("qmi tx", m->buf + 6, m->len - 6);
         if (sendto(qc->fd, m->buf + 6, m->len - 6, 0, (void *)&sq, sizeof(sq)) < 0) {
             printf("error=qrtr send svc 0x%02x: %s\n", svc, strerror(errno));
             return -1;
@@ -286,6 +338,8 @@ static int transact(struct msg *m, uint8_t svc, uint16_t msgid, uint16_t txn, st
     } else if (msg_send(m) < 0) {
         printf("error=write %s: %s\n", QMI_DEV_DEFAULT, strerror(errno));
         return -1;
+    } else {
+        dump_frame("qmi tx", m->buf, m->len);
     }
     long deadline = now_ms() + timeout_ms;
     for (;;) {
@@ -308,11 +362,16 @@ static int transact(struct msg *m, uint8_t svc, uint16_t msgid, uint16_t txn, st
         }
         if (ret == 0) continue;
         if (type == 4) {
+            dump_frame("qmi ind", r->buf, r->len);
             handle_indication(rsvc, rmsg, r);
             continue;
         }
-        if (type == 2 && rsvc == svc && rcid == cid && rmsg == msgid && rtxn == txn)
+        if (type == 2 && rsvc == svc && rcid == cid && rmsg == msgid && rtxn == txn) {
+            dump_frame("qmi rx", r->buf, r->len);
+            printf("info=qmi svc 0x%02x msg 0x%04x txn %u result %u error %u len %zu\n", svc,
+                   msgid, txn, r->result, r->error, r->len);
             return r->result == 0 ? 0 : -1;
+        }
     }
 }
 
@@ -353,8 +412,8 @@ static int wda_set_raw_ip(int with_endpoint) {
     uint16_t txn;
     msg_init(&m, SVC_WDA, s_wda_cid, WDA_SET_DATA_FORMAT, &txn);
     tlv32(&m, 0x11, 2);  /* link layer protocol: raw IP */
-    tlv32(&m, 0x12, 0);  /* UL aggregation: disabled */
-    tlv32(&m, 0x13, 0);  /* DL aggregation: disabled */
+    tlv32(&m, 0x12, s_qmap ? 5 : 0);  /* UL aggregation: QMAP or disabled */
+    tlv32(&m, 0x13, s_qmap ? 5 : 0);  /* DL aggregation: QMAP or disabled */
     if (with_endpoint) {
         uint8_t ep[8] = {3, 0, 0, 0, 4, 0, 0, 0};  /* PCIe, interface 4 (as ModemManager) */
         tlv(&m, 0x17, ep, sizeof(ep));
@@ -440,9 +499,15 @@ static void wds_stop(uint32_t handle) {
     struct msg m;
     struct resp r;
     uint16_t txn;
+
+    /* handle 0 means "NoEffect": the bearer already existed and this client did
+     * not start it. Never tear down a call we do not own. */
+    if (!handle) {
+        printf("info=skip stop: bearer was not started by this client\n");
+        return;
+    }
     msg_init(&m, SVC_WDS, s_wds_cid, WDS_STOP_NETWORK, &txn);
-    tlv32(&m, 0x01, handle ? handle : 0xffffffff);
-    if (!handle) tlv8(&m, 0x10, 0);  /* autoconnect off */
+    tlv32(&m, 0x01, handle);
     transact(&m, SVC_WDS, WDS_STOP_NETWORK, txn, &r, 5000);
 }
 
@@ -486,6 +551,122 @@ static void iface_setup(const char *ifname, int up, uint32_t mtu) {
             printf("warning=set %s %s: %s\n", ifname, up ? "up" : "down", strerror(errno));
     }
     close(fd);
+}
+
+/* ---------- rmnet link creation (QMAP probe mode) ---------- */
+
+#define NLMSG_TAIL(nmsg) \
+    ((struct rtattr *)(((char *)(nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+
+static void nl_attr(struct nlmsghdr *n, size_t maxlen, int type,
+                    const void *data, size_t len) {
+    size_t alen = RTA_LENGTH(len);
+    struct rtattr *rta;
+
+    if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(alen) > maxlen) return;
+    rta = NLMSG_TAIL(n);
+    rta->rta_type = type;
+    rta->rta_len = alen;
+    if (len) memcpy(RTA_DATA(rta), data, len);
+    n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(alen);
+}
+
+static void nl_attr_u16(struct nlmsghdr *n, size_t maxlen, int type, uint16_t v) {
+    nl_attr(n, maxlen, type, &v, sizeof(v));
+}
+
+static void nl_attr_u32(struct nlmsghdr *n, size_t maxlen, int type, uint32_t v) {
+    nl_attr(n, maxlen, type, &v, sizeof(v));
+}
+
+static void nl_attr_str(struct nlmsghdr *n, size_t maxlen, int type, const char *s) {
+    nl_attr(n, maxlen, type, s, strlen(s) + 1);
+}
+
+static int nl_close_attr(struct nlmsghdr *n, struct rtattr *rta) {
+    rta->rta_len = (char *)NLMSG_TAIL(n) - (char *)rta;
+    return 0;
+}
+
+/* RTM_NEWLINK: rmnet_data<mux> on <base>, QMAP mux <mux>. */
+static int rmnet_link_add(const char *base, const char *name, unsigned int mux) {
+    struct {
+        struct nlmsghdr n;
+        struct ifinfomsg i;
+        char buf[512];
+    } req;
+    struct sockaddr_nl sa;
+    struct rtattr *linkinfo, *data;
+    unsigned int base_idx = if_nametoindex(base);
+    char resp[1024];
+    ssize_t n;
+
+    memset(&req, 0, sizeof(req));
+    req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    req.n.nlmsg_type = RTM_NEWLINK;
+    req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    req.n.nlmsg_seq = 1;
+    req.i.ifi_family = AF_UNSPEC;
+
+    if (!base_idx) {
+        printf("error=no base netdev %s\n", base);
+        return -ENODEV;
+    }
+
+    nl_attr_str(&req.n, sizeof(req), IFLA_IFNAME, name);
+    nl_attr_u32(&req.n, sizeof(req), IFLA_LINK, base_idx);
+
+    linkinfo = NLMSG_TAIL(&req.n);
+    nl_attr(&req.n, sizeof(req), IFLA_LINKINFO, NULL, 0);
+    nl_attr_str(&req.n, sizeof(req), IFLA_INFO_KIND, "rmnet");
+
+    data = NLMSG_TAIL(&req.n);
+    nl_attr(&req.n, sizeof(req), IFLA_INFO_DATA, NULL, 0);
+    nl_attr_u16(&req.n, sizeof(req), IFLA_RMNET_MUX_ID, (uint16_t)mux);
+    nl_close_attr(&req.n, data);
+    nl_close_attr(&req.n, linkinfo);
+
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0) return -errno;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    if (sendto(fd, &req, req.n.nlmsg_len, 0, (struct sockaddr *)&sa,
+               sizeof(sa)) < 0) {
+        int err = -errno;
+        close(fd);
+        return err;
+    }
+
+    n = recv(fd, resp, sizeof(resp), 0);
+    close(fd);
+    if (n < (ssize_t)sizeof(struct nlmsghdr)) return -EIO;
+    struct nlmsghdr *nh = (struct nlmsghdr *)resp;
+    if (nh->nlmsg_type == NLMSG_ERROR && n >= (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(nh);
+        return e->error; /* 0 = success, negative errno otherwise */
+    }
+    return -EIO;
+}
+
+static int qmap_prepare_link(void) {
+    const char *base = getenv("KEBAB_QMAP_DEV");
+    char name[IFNAMSIZ];
+    int err;
+
+    if (!base || !*base) base = "mhi_hwip0";
+    snprintf(name, sizeof(name), "rmnet_data%u", s_qmap_mux);
+    err = rmnet_link_add(base, name, s_qmap_mux);
+    if (err && err != -EEXIST) {
+        printf("error=create %s on %s mux %u: %s\n", name, base,
+               s_qmap_mux, strerror(-err));
+        return -1;
+    }
+    iface_setup(base, 1, 0);
+    iface_setup(name, 1, 0);
+    setenv("KEBAB_DATA_IFACE", name, 1);
+    printf("info=qmap mux %u on %s/%s\n", s_qmap_mux, base, name);
+    return 0;
 }
 
 /*
@@ -535,8 +716,23 @@ static void iface_v6(const char *ifname, const uint8_t *addr, int prefix, int ad
     close(fd);
 }
 
+/* SIOCSIFADDR with 0.0.0.0 does not remove an address; SIOCDIFADDR does. */
+static void iface_del_v4(const char *ifname) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = s_v4_addr ? htonl(s_v4_addr) : 0;
+    if (ioctl(fd, SIOCDIFADDR, &ifr) < 0)
+        printf("warning=clear ipv4 address on %s: %s\n", ifname, strerror(errno));
+    close(fd);
+}
+
 static void iface_clear_addrs(const char *ifname) {
-    if (s_v4_addr) iface_set_v4(ifname, 0, 0);
+    if (s_v4_addr) iface_del_v4(ifname);
     if (s_v6_prefix >= 0) iface_v6(ifname, s_v6_addr, s_v6_prefix, 0);
     s_v4_addr = 0;
     s_v6_prefix = -1;
@@ -806,6 +1002,7 @@ static int qrtr_transact(int fd, const struct qsvc *q, struct msg *m, uint16_t m
     struct sockaddr_qrtr sq = {.sq_family = AF_QIPCRTR, .sq_node = q->node, .sq_port = q->port};
     r->result = r->error = 0xffff;
     r->tlvs_len = 0;
+    dump_frame("qmi tx", m->buf + 6, m->len - 6);
     if (sendto(fd, m->buf + 6, m->len - 6, 0, (void *)&sq, sizeof(sq)) < 0) {
         printf("error=qrtr send: %s\n", strerror(errno));
         return -1;
@@ -819,6 +1016,8 @@ static int qrtr_transact(int fd, const struct qsvc *q, struct msg *m, uint16_t m
         uint8_t flags = r->buf[0];
         uint16_t rtxn = get16(r->buf + 1), rmsg = get16(r->buf + 3), rl = get16(r->buf + 5);
         if (!(flags & 0x02) || rtxn != txn || rmsg != msgid) continue;
+        dump_frame("qmi rx", r->buf, n);
+        r->len = n;
         r->tlvs = r->buf + 7;
         r->tlvs_len = (size_t)n - 7 < rl ? (size_t)n - 7 : rl;
         uint16_t l;
@@ -1435,19 +1634,25 @@ static const uint8_t *sdu_find(const uint8_t *b, size_t len, uint8_t t, uint16_t
     return NULL;
 }
 
-/* Address of the call this client started, as text; 0 on success */
-static int wds_get_addr_text(uint8_t fam, char *out, size_t outlen) {
+/* Address of the call this client started, as text and raw; 0 on success */
+static int wds_get_addr_full(uint8_t fam, char *out, size_t outlen, uint8_t *raw, int *prefix) {
     struct msg m;
     struct resp r;
     uint16_t txn, l;
     const uint8_t *v;
     msg_init(&m, SVC_WDS, s_wds_cid, WDS_GET_CURRENT_SETTINGS, &txn);
-    tlv32(&m, 0x10, (1 << 8) | (1 << 15)); /* IP address, IP family */
+    tlv32(&m, 0x10, 0x000fffff); /* IP address, IP family, DNS, Gateway, P-CSCF */
     if (transact(&m, SVC_WDS, WDS_GET_CURRENT_SETTINGS, txn, &r, 10000)) return -1;
-    if (fam == 6 && (v = find_tlv(&r, 0x25, &l)) && l >= 17)
+    dump_tlvs("wds-settings", &r);
+    if (fam == 6 && (v = find_tlv(&r, 0x25, &l)) && l >= 17) {
+        if (raw) memcpy(raw, v, 16);
+        if (prefix) *prefix = v[16];
         return inet_ntop(AF_INET6, v, out, outlen) ? 0 : -1;
+    }
     if (fam == 4 && (v = find_tlv(&r, 0x1e, &l)) && l >= 4) {
         struct in_addr a = {.s_addr = htonl(get32(v))};
+        if (raw) memcpy(raw, v, 4);
+        if (prefix) *prefix = 32;
         return inet_ntop(AF_INET, &a, out, outlen) ? 0 : -1;
     }
     return -1;
@@ -1482,6 +1687,10 @@ static int ims_dcm(int secs) {
 
     uint32_t handle = 0;
     int call_up = 0;
+    char ifname[IFNAMSIZ] = "mhi_hwip0";
+    uint8_t ims_v6[16];
+    int ims_v6_prefix = -1;
+    find_ifname(ifname, sizeof(ifname));
     long end = secs > 0 ? now_ms() + secs * 1000L : 0;
     while (!s_stop && (!end || now_ms() < end)) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
@@ -1509,6 +1718,10 @@ static int ims_dcm(int secs) {
             sdu_send(fd, &from, &o);
             if (call_up) {
                 printf("info=ims pdp deactivate\n");
+                if (ims_v6_prefix >= 0) {
+                    iface_v6(ifname, ims_v6, ims_v6_prefix, 0);
+                    ims_v6_prefix = -1;
+                }
                 wds_stop(handle);
                 call_up = 0;
                 handle = 0;
@@ -1538,6 +1751,8 @@ static int ims_dcm(int secs) {
         sdu_send(fd, &from, &o);
 
         char addr[64] = "";
+        uint8_t v6_raw[16];
+        int v6_prefix = -1;
         int ok = call_up;
         if (!call_up) {
             /*
@@ -1549,16 +1764,33 @@ static int ims_dcm(int secs) {
             static int bound;
             if (!bound) {
                 const char *bs = getenv("KEBAB_IMS_BIND");
-                unsigned ep = 4, mux = 0;
+                unsigned ep = 4, mux = s_qmap ? s_qmap_mux + 1 : 0;
                 if (bs && *bs) sscanf(bs, "%u:%u", &ep, &mux);
+                if (mux > 0xff) {
+                    mux = s_qmap ? 2 : 0;
+                    printf("warning=ignoring mux >255, using %u\n", mux);
+                }
                 bound = wds_bind_data_port(ep, mux) == 0;
             }
             wds_set_family(fam);
             ok = wds_start(*apn ? apn : "ims", fam, &handle) == 0;
             call_up = ok;
         }
-        if (ok && wds_get_addr_text(fam, addr, sizeof(addr))) ok = 0;
+        if (ok && wds_get_addr_full(fam, addr, sizeof(addr), v6_raw, &v6_prefix)) ok = 0;
         printf("info=ims pdp %s %s\n", ok ? "up" : "failed", addr);
+        if (ok && fam == 6 && v6_prefix >= 0) {
+            char rcmd[160];
+
+            find_ifname(ifname, sizeof(ifname));
+            iface_v6(ifname, v6_raw, v6_prefix, 1);
+            memcpy(ims_v6, v6_raw, 16);
+            ims_v6_prefix = v6_prefix;
+            snprintf(rcmd, sizeof(rcmd),
+                     "ip -6 route replace default dev %s table %s 2>/dev/null",
+                     ifname, ifname);
+            system(rcmd);
+            system("ip -6 rule add pref 1000 lookup main 2>/dev/null");
+        }
 
         sdu_init(&o, 0x04, 0, 0x20);
         sdu_result(&o, ok ? 0 : 1, ok ? 0 : 14 /* CALL_FAILED */);
@@ -1567,14 +1799,34 @@ static int ims_dcm(int secs) {
         if (ok) {
             uint8_t a[4 + 1 + 48];
             size_t al = strlen(addr);
-            a[0] = family & 0xff;
+            /*
+             * Qualcomm IMS DCM IDL specification (imsdatadaemon):
+             * family_type 1 is CS_IPV4, 2 is CS_IPV6.
+             * Sending 1 with IPv6 address causes "Family type mismatch"
+             * and SIP 408 Request Timeout.
+             */
+            a[0] = (fam == 6) ? 2 : 1;
             a[1] = a[2] = a[3] = 0;
             a[4] = al;
             memcpy(a + 5, addr, al);
             sdu_tlv(&o, 0x11, a, 5 + al);
         }
-        sdu_tlv32(&o, 0x12, echo);
+        if (echo) sdu_tlv32(&o, 0x12, echo);
         if (sdu_send(fd, &from, &o)) printf("warning=dcm ind send: %s\n", strerror(errno));
+
+        /* Also send QMI_IMS_DCM_ADDRESS_CHANGE_IND_V01 (0x24) as stock does */
+        if (ok) {
+            uint8_t a[4 + 1 + 48];
+            size_t al = strlen(addr);
+            a[0] = (fam == 6) ? 2 : 1;
+            a[1] = a[2] = a[3] = 0;
+            a[4] = al;
+            memcpy(a + 5, addr, al);
+            sdu_init(&o, 0x04, 0, 0x24);
+            sdu_tlv(&o, 0x01, &pid, 1);
+            sdu_tlv(&o, 0x10, a, 5 + al);
+            sdu_send(fd, &from, &o);
+        }
         fflush(stdout);
     }
     if (call_up) wds_stop(handle);
@@ -1627,7 +1879,30 @@ static int qrtr_open_clients(void) {
     return 0;
 }
 
+/* kebab-dataconn --qrtr-list : print every service published on QRTR */
+static int qrtr_list(int argc __attribute__((unused)), char **argv __attribute__((unused))) {
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_qrtr me;
+    socklen_t sl = sizeof(me);
+    if (fd < 0 || getsockname(fd, (void *)&me, &sl) < 0) {
+        printf("error=qrtr socket: %s\n", strerror(errno));
+        if (fd >= 0) close(fd);
+        return 1;
+    }
+    struct qsvc list[256];
+    int n = qrtr_lookup(fd, me.sq_node, list, 256);
+    for (int i = 0; i < n; i++)
+        printf("svc 0x%03x v%u inst %u node %u port %u\n", list[i].svc, list[i].ver,
+               list[i].inst, list[i].node, list[i].port);
+    if (!n)
+        printf("no services\n");
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--qrtr-list"))
+        return qrtr_list(argc, argv);
     if (argc > 2 && !strcmp(argv[1], "--diag-msgs")) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         struct sigaction sa;
@@ -1700,6 +1975,24 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (!dev || !*dev) dev = QMI_DEV_DEFAULT;
 
+    /*
+     * Opt-in QMAP probe: raw-IP mhi_hwip0 wedges after sustained traffic.
+     * With KEBAB_QMAP=1 set WDA UL/DL aggregation to QMAP, bind this WDS
+     * client to KEBAB_QMAP_MUX (default 1), and create the matching
+     * rmnet_dataN link. The default raw-IP path is untouched.
+     */
+    {
+        const char *q = getenv("KEBAB_QMAP");
+        s_qmap = q && *q && strcmp(q, "0");
+        if (s_qmap) {
+            const char *qm = getenv("KEBAB_QMAP_MUX");
+            if (qm && *qm) s_qmap_mux = (unsigned int)strtoul(qm, NULL, 0);
+            if (!s_qmap_mux || s_qmap_mux > 255) s_qmap_mux = 1;
+            if (qmap_prepare_link())
+                return 1;
+        }
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -1736,7 +2029,8 @@ int main(int argc, char **argv) {
     }
     if (s_qrtr) {
         const char *ifs = getenv("KEBAB_EP_IFACE");
-        wds_bind_data_port(ifs && *ifs ? strtoul(ifs, NULL, 0) : 4, 0);
+        wds_bind_data_port(ifs && *ifs ? strtoul(ifs, NULL, 0) : 4,
+                           s_qmap ? s_qmap_mux : 0);
     }
     wds_set_family(fam);
     /* a cancelled or timed-out start may still come up: always tear down */

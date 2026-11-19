@@ -118,6 +118,7 @@ int main(int argc, char **argv) {
 
     RLOGD("**RIL Daemon Started - Version 1.4**");
     RLOGD("**RILd param count=%d**", argc);
+    for (int a = 0; a < argc; a++) RLOGD("**RILd arg[%d]=%s**", a, argv[a]);
 
     umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
     for (i = 1; i < argc ;) {

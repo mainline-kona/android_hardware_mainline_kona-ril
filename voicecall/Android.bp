@@ -1,0 +1,14 @@
+// Holds the hostless CS-VOICE front end open while a call is active.
+cc_binary {
+    name: "kebab-voicecall",
+    vendor: true,
+    srcs: ["kebab-voicecall.c"],
+    shared_libs: [
+        "liblog",
+        "libtinyalsa",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}

@@ -631,6 +631,9 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
 
     socket_id = pRI->socket_id;
 
+    RLOGD("R[%04d]< %s err=%d len=%zu", pRI->token,
+          requestToString(pRI->pCI->requestNumber), (int)e, responselen);
+
 #if VDBG
     RLOGD("RequestComplete, %s", rilSocketIdToString(socket_id));
 #endif
@@ -760,7 +763,7 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
 #endif
 {
     int unsolResponseIndex;
-    int ret;
+    int ret = 0;
     bool shouldScheduleTimeout = false;
     RIL_SOCKET_ID soc_id = RIL_SOCKET_1;
     UnsolResponseInfo *pURI = NULL;
@@ -841,6 +844,7 @@ void RIL_onUnsolicitedResponse(int unsolResponse, const void *data,
     } else {
         RLOGW("No call responseFunction defined for UNSOLICITED");
     }
+    RLOGD("UNSL< %s len=%zu delivered=%d", requestToString(unsolResponse), datalen, ret);
 
     rwlockRet = pthread_rwlock_unlock(radioServiceRwlockPtr);
     assert(rwlockRet == 0);

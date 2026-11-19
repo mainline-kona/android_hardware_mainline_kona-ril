@@ -1,0 +1,61 @@
+// kebab-rild: the 100% open radio stack for kebab.
+//
+// M0 ships the transport probe; M2 ships libkebab-rilqmi, loaded by the
+// existing rild binary (`-l libkebab-rilqmi.so`) behind
+// (single engine: the legacy reference-ril was removed).
+
+cc_library_shared {
+    name: "libkebab-rilqmi",
+    vendor: true,
+    srcs: [
+        "cell.c",
+        "data.c",
+        "dcm.c",
+        "dms.c",
+        "ims.c",
+        "kebab-ril.c",
+        "nas.c",
+        "state.c",
+        "uim.c",
+        "voice.c",
+        "wms.c",
+        "qmi/qmi.c",
+    ],
+    include_dirs: [
+        "device/oneplus/kebab_mainline/radio",
+    ],
+    header_libs: [
+        "ril_headers",
+    ],
+    shared_libs: [
+        "libbase",
+        "libcutils",
+        "liblog",
+        "libril-modem-lib",
+    ],
+    cflags: [
+        "-DRIL_SHLIB",
+        "-D_GNU_SOURCE",
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+        "-Wno-unused-parameter",
+    ],
+}
+
+cc_binary {
+    name: "kebab-qmi-probe",
+    vendor: true,
+    srcs: ["kebab-qmi-probe.c"],
+    shared_libs: [
+        "libqmi-glib",
+        "libqrtr-glib",
+        "libglib-2.0",
+        "libgio-2.0",
+        "libgobject-2.0",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
