@@ -37,6 +37,7 @@ typedef struct {
 } Wait;
 
 static void on_done(GObject *source, GAsyncResult *res, gpointer data) {
+    (void)source;
     Wait *w = data;
     w->res = g_object_ref(res);
     g_main_loop_quit(w->loop);
@@ -61,9 +62,12 @@ static guint read_sysfs_uint(const char *path) {
 }
 
 static const char *get_parent_iface(void) {
-    if (if_nametoindex("wwan0") > 0) return "wwan0";
-    if (if_nametoindex("rmnet_mhi0") > 0) return "rmnet_mhi0";
-    if (if_nametoindex("rmnet_ipa0") > 0) return "rmnet_ipa0";
+    for (int retry = 0; retry < 10; retry++) {
+        if (if_nametoindex("wwan0") > 0) return "wwan0";
+        if (if_nametoindex("rmnet_mhi0") > 0) return "rmnet_mhi0";
+        if (if_nametoindex("rmnet_ipa0") > 0) return "rmnet_ipa0";
+        usleep(100000);
+    }
     return "wwan0";
 }
 
@@ -91,7 +95,19 @@ static void set_iface_up(const char *ifname) {
     close(fd);
 }
 
-static void configure_ipv4(const char *ifname, guint32 addr, guint32 mask, guint32 mtu) {
+static void set_iface_mtu(const char *ifname, guint32 mtu) {
+    if (!mtu) return;
+    struct ifreq ifr;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    ifr.ifr_mtu = mtu;
+    if (ioctl(fd, SIOCSIFMTU, &ifr) < 0) printf("warning=set mtu: %s\n", strerror(errno));
+    close(fd);
+}
+
+static void configure_ipv4(const char *ifname, guint32 addr, guint32 mask) {
     struct ifreq ifr;
     struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -103,10 +119,6 @@ static void configure_ipv4(const char *ifname, guint32 addr, guint32 mask, guint
     if (ioctl(fd, SIOCSIFADDR, &ifr) < 0) printf("warning=set address: %s\n", strerror(errno));
     sin->sin_addr.s_addr = htonl(mask);
     if (ioctl(fd, SIOCSIFNETMASK, &ifr) < 0) printf("warning=set netmask: %s\n", strerror(errno));
-    if (mtu) {
-        ifr.ifr_mtu = mtu;
-        if (ioctl(fd, SIOCSIFMTU, &ifr) < 0) printf("warning=set mtu: %s\n", strerror(errno));
-    }
     close(fd);
 }
 
@@ -132,6 +144,7 @@ static gboolean s_disconnected;
 
 static void on_packet_service_status(QmiClientWds *wds, QmiIndicationWdsPacketServiceStatusOutput *ind,
                                      gpointer loop) {
+    (void)wds;
     QmiWdsConnectionStatus status;
     if (!qmi_indication_wds_packet_service_status_output_get_connection_status(ind, &status, NULL, NULL) ||
             status != QMI_WDS_CONNECTION_STATUS_DISCONNECTED)
@@ -150,11 +163,6 @@ int main(int argc, char **argv) {
     guint req_mux_id = argc > 3 ? (guint)atoi(argv[3]) : 1;
     if (req_mux_id == 0) req_mux_id = 1;
 
-    const char *parent = get_parent_iface();
-    QmiDataEndpointType ep_type = QMI_DATA_ENDPOINT_TYPE_PCIE;
-    guint ep_index = 4;
-    get_endpoint_info(parent, &ep_type, &ep_index);
-
     qrtr_bus_new(1000, NULL, on_done, &w);
     g_autoptr(QrtrBus) bus = qrtr_bus_new_finish(wait_result(&w), &error);
     if (!bus) fail("open qrtr bus", error);
@@ -170,6 +178,11 @@ int main(int argc, char **argv) {
 
     qmi_device_open(dev, QMI_DEVICE_OPEN_FLAGS_NONE, 15, NULL, on_done, &w);
     if (!qmi_device_open_finish(dev, wait_result(&w), &error)) fail("open device", error);
+
+    const char *parent = get_parent_iface();
+    QmiDataEndpointType ep_type = QMI_DATA_ENDPOINT_TYPE_PCIE;
+    guint ep_index = 4;
+    get_endpoint_info(parent, &ep_type, &ep_index);
 
     QmiClient *dpm = allocate(dev, QMI_SERVICE_DPM, &w);
     QmiClient *wda = allocate(dev, QMI_SERVICE_WDA, &w);
@@ -249,9 +262,9 @@ int main(int argc, char **argv) {
         g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
         if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
         QmiWdsIpFamily ip_family = QMI_WDS_IP_FAMILY_UNSPECIFIED;
-        if (strcmp(protocol, "ipv6") == 0) {
+        if (strcasecmp(protocol, "ipv6") == 0) {
             ip_family = QMI_WDS_IP_FAMILY_IPV6;
-        } else if (strcmp(protocol, "ipv4") == 0) {
+        } else if (strcasecmp(protocol, "ipv4") == 0) {
             ip_family = QMI_WDS_IP_FAMILY_IPV4;
         }
         qmi_message_wds_start_network_input_set_ip_family_preference(in, ip_family, NULL);
@@ -339,8 +352,10 @@ int main(int argc, char **argv) {
         }
 
         /* MTU */
-        if (qmi_message_wds_get_current_settings_output_get_mtu(out, &mtu, NULL))
+        if (qmi_message_wds_get_current_settings_output_get_mtu(out, &mtu, NULL)) {
             printf("mtu=%u\n", mtu);
+            set_iface_mtu(ifname, mtu);
+        }
 
         /* P-CSCF server addresses (IMS) */
         GArray *pcscf_list = NULL;
@@ -353,10 +368,10 @@ int main(int argc, char **argv) {
         }
 
         /* Configure network interface */
-        if (has_ipv4) configure_ipv4(ifname, addr, mask, mtu);
+        if (has_ipv4) configure_ipv4(ifname, addr, mask);
         if (has_ipv6) {
             char cmd[128];
-            snprintf(cmd, sizeof(cmd), "ip -6 addr replace %s/%u dev %s", buf6, prefix6, ifname);
+            snprintf(cmd, sizeof(cmd), "ip -6 addr replace %s/%u dev %s nodad", buf6, prefix6, ifname);
             int res = system(cmd);
             (void)res;
         }
