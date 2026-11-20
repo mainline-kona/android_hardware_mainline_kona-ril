@@ -4,12 +4,15 @@
  */
 
 /*
- * Brings up one mobile data session on the modem behind IPA and holds it until SIGTERM.
+ * Brings up one mobile data session on the modem and holds it until SIGTERM.
  *
- * Usage: kona-dataconn <apn> <ipv4|ipv6|ipv4v6>
- * Prints key=value lines (ifname, address, gateway, dns, mtu) and then "ready" once the
- * session is up, or "error=<reason>" and exits non-zero. Prints "disconnected" and exits
- * when the modem drops the session.
+ * Supports PCIe MHI endpoints (wwan0 / rmnet_mhi0 on SM8250+SDX55 Kona) with fallback
+ * to embedded IPA endpoints (rmnet_ipa0).
+ *
+ * Usage: kona-dataconn <apn> <ipv4|ipv6|ipv4v6> [mux_id]
+ * Prints key=value lines (ifname, address, ipv6_address, gateway, dns, pcscf, mtu)
+ * and then "ready" once the session is up, or "error=<reason>" and exits non-zero.
+ * Prints "disconnected" and exits when the modem drops the session.
  */
 
 #include <arpa/inet.h>
@@ -26,9 +29,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define IPA_IFACE "rmnet_ipa0"
 #define LINK_PREFIX "rmnet_data"
-#define MUX_ID 1
 
 typedef struct {
     GMainLoop *loop;
@@ -57,6 +58,24 @@ static guint read_sysfs_uint(const char *path) {
     g_autofree gchar *contents = NULL;
     if (!g_file_get_contents(path, &contents, NULL, NULL)) return 0;
     return (guint)strtoul(contents, NULL, 0);
+}
+
+static const char *get_parent_iface(void) {
+    if (if_nametoindex("wwan0") > 0) return "wwan0";
+    if (if_nametoindex("rmnet_mhi0") > 0) return "rmnet_mhi0";
+    if (if_nametoindex("rmnet_ipa0") > 0) return "rmnet_ipa0";
+    return "wwan0";
+}
+
+static void get_endpoint_info(const char *parent, QmiDataEndpointType *ep_type, guint *ep_index) {
+    if (strcmp(parent, "rmnet_ipa0") == 0) {
+        *ep_type = QMI_DATA_ENDPOINT_TYPE_EMBEDDED;
+        *ep_index = 1;
+    } else {
+        /* External modem over PCIe (SDX55 on Kona, IP_HW0) */
+        *ep_type = QMI_DATA_ENDPOINT_TYPE_PCIE;
+        *ep_index = 4;
+    }
 }
 
 static void set_iface_up(const char *ifname) {
@@ -128,6 +147,13 @@ int main(int argc, char **argv) {
     Wait w = {.loop = g_main_loop_new(NULL, FALSE)};
     const char *apn = argc > 1 ? argv[1] : "";
     const char *protocol = argc > 2 ? argv[2] : "ipv4";
+    guint req_mux_id = argc > 3 ? (guint)atoi(argv[3]) : 1;
+    if (req_mux_id == 0) req_mux_id = 1;
+
+    const char *parent = get_parent_iface();
+    QmiDataEndpointType ep_type = QMI_DATA_ENDPOINT_TYPE_PCIE;
+    guint ep_index = 4;
+    get_endpoint_info(parent, &ep_type, &ep_index);
 
     qrtr_bus_new(1000, NULL, on_done, &w);
     g_autoptr(QrtrBus) bus = qrtr_bus_new_finish(wait_result(&w), &error);
@@ -149,13 +175,16 @@ int main(int argc, char **argv) {
     QmiClient *wda = allocate(dev, QMI_SERVICE_WDA, &w);
     QmiClient *wds = allocate(dev, QMI_SERVICE_WDS, &w);
 
-    /* The modem's TX endpoint feeds IPA's RX port and the other way round */
-    guint tx_id = read_sysfs_uint("/sys/class/net/" IPA_IFACE "/device/modem/tx_endpoint_id");
-    guint rx_id = read_sysfs_uint("/sys/class/net/" IPA_IFACE "/device/modem/rx_endpoint_id");
+    /* IPA only: the modem's TX endpoint feeds IPA's RX port and the other way round */
+    char sysfs_tx[128], sysfs_rx[128];
+    snprintf(sysfs_tx, sizeof(sysfs_tx), "/sys/class/net/%s/device/modem/tx_endpoint_id", parent);
+    snprintf(sysfs_rx, sizeof(sysfs_rx), "/sys/class/net/%s/device/modem/rx_endpoint_id", parent);
+    guint tx_id = read_sysfs_uint(sysfs_tx);
+    guint rx_id = read_sysfs_uint(sysfs_rx);
     if (tx_id && rx_id) {
         QmiMessageDpmOpenPortInputHardwareDataPortsElement port = {
-            .endpoint_type = QMI_DATA_ENDPOINT_TYPE_EMBEDDED,
-            .interface_number = 1,
+            .endpoint_type = ep_type,
+            .interface_number = ep_index,
             .rx_endpoint_number = tx_id,
             .tx_endpoint_number = rx_id,
         };
@@ -182,7 +211,7 @@ int main(int argc, char **argv) {
         qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_size(in, 32768, NULL);
         qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_datagrams(in, 32, NULL);
         qmi_message_wda_set_data_format_input_set_endpoint_info(
-                in, QMI_DATA_ENDPOINT_TYPE_EMBEDDED, 1, NULL);
+                in, ep_type, ep_index, NULL);
         qmi_client_wda_set_data_format(QMI_CLIENT_WDA(wda), in, 10, NULL, on_done, &w);
         g_autoptr(QmiMessageWdaSetDataFormatOutput) out =
                 qmi_client_wda_set_data_format_finish(QMI_CLIENT_WDA(wda), wait_result(&w), &error);
@@ -190,11 +219,11 @@ int main(int argc, char **argv) {
             fail("set data format", error);
     }
 
-    set_iface_up(IPA_IFACE);
-    qmi_device_delete_all_links(dev, IPA_IFACE, NULL, on_done, &w);
+    set_iface_up(parent);
+    qmi_device_delete_all_links(dev, parent, NULL, on_done, &w);
     qmi_device_delete_all_links_finish(dev, wait_result(&w), NULL);
 
-    qmi_device_add_link_with_flags(dev, MUX_ID, IPA_IFACE, LINK_PREFIX,
+    qmi_device_add_link_with_flags(dev, req_mux_id, parent, LINK_PREFIX,
                                    QMI_DEVICE_ADD_LINK_FLAGS_INGRESS_MAP_CKSUMV5 |
                                            QMI_DEVICE_ADD_LINK_FLAGS_EGRESS_MAP_CKSUMV5,
                                    NULL, on_done, &w);
@@ -206,8 +235,8 @@ int main(int argc, char **argv) {
     {
         g_autoptr(QmiMessageWdsBindMuxDataPortInput) in = qmi_message_wds_bind_mux_data_port_input_new();
         qmi_message_wds_bind_mux_data_port_input_set_endpoint_info(
-                in, QMI_DATA_ENDPOINT_TYPE_EMBEDDED, 1, NULL);
-        qmi_message_wds_bind_mux_data_port_input_set_mux_id(in, MUX_ID, NULL);
+                in, ep_type, ep_index, NULL);
+        qmi_message_wds_bind_mux_data_port_input_set_mux_id(in, mux_id, NULL);
         qmi_client_wds_bind_mux_data_port(QMI_CLIENT_WDS(wds), in, 10, NULL, on_done, &w);
         g_autoptr(QmiMessageWdsBindMuxDataPortOutput) out =
                 qmi_client_wds_bind_mux_data_port_finish(QMI_CLIENT_WDS(wds), wait_result(&w), &error);
@@ -219,8 +248,13 @@ int main(int argc, char **argv) {
     {
         g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
         if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
-        qmi_message_wds_start_network_input_set_ip_family_preference(
-                in, strcmp(protocol, "ipv6") == 0 ? QMI_WDS_IP_FAMILY_IPV6 : QMI_WDS_IP_FAMILY_IPV4, NULL);
+        QmiWdsIpFamily ip_family = QMI_WDS_IP_FAMILY_UNSPECIFIED;
+        if (strcmp(protocol, "ipv6") == 0) {
+            ip_family = QMI_WDS_IP_FAMILY_IPV6;
+        } else if (strcmp(protocol, "ipv4") == 0) {
+            ip_family = QMI_WDS_IP_FAMILY_IPV4;
+        }
+        qmi_message_wds_start_network_input_set_ip_family_preference(in, ip_family, NULL);
         qmi_client_wds_start_network(QMI_CLIENT_WDS(wds), in, 60, NULL, on_done, &w);
         g_autoptr(QmiMessageWdsStartNetworkOutput) out =
                 qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds), wait_result(&w), &error);
@@ -237,8 +271,12 @@ int main(int argc, char **argv) {
         g_autoptr(QmiMessageWdsGetCurrentSettingsInput) in = qmi_message_wds_get_current_settings_input_new();
         qmi_message_wds_get_current_settings_input_set_requested_settings(
                 in,
-                QMI_WDS_REQUESTED_SETTINGS_IP_ADDRESS | QMI_WDS_REQUESTED_SETTINGS_GATEWAY_INFO |
-                        QMI_WDS_REQUESTED_SETTINGS_DNS_ADDRESS | QMI_WDS_REQUESTED_SETTINGS_MTU,
+                QMI_WDS_REQUESTED_SETTINGS_IP_ADDRESS |
+                QMI_WDS_REQUESTED_SETTINGS_GATEWAY_INFO |
+                QMI_WDS_REQUESTED_SETTINGS_DNS_ADDRESS |
+                QMI_WDS_REQUESTED_SETTINGS_MTU |
+                QMI_WDS_REQUESTED_SETTINGS_PCSCF_SERVER_ADDRESS_LIST |
+                QMI_WDS_REQUESTED_SETTINGS_IP_FAMILY,
                 NULL);
         qmi_client_wds_get_current_settings(QMI_CLIENT_WDS(wds), in, 10, NULL, on_done, &w);
         g_autoptr(QmiMessageWdsGetCurrentSettingsOutput) out =
@@ -246,11 +284,12 @@ int main(int argc, char **argv) {
         if (!out || !qmi_message_wds_get_current_settings_output_get_result(out, &error))
             fail("get current settings", error);
 
-        guint32 addr, mask = 0xffffffff, gw, dns, mtu = 0;
-        gboolean has_addr;
         printf("ifname=%s\n", ifname);
-        has_addr = qmi_message_wds_get_current_settings_output_get_ipv4_address(out, &addr, NULL);
-        if (has_addr) {
+
+        /* IPv4 settings */
+        guint32 addr = 0, mask = 0xffffffff, gw = 0, dns = 0, mtu = 0;
+        gboolean has_ipv4 = qmi_message_wds_get_current_settings_output_get_ipv4_address(out, &addr, NULL);
+        if (has_ipv4) {
             qmi_message_wds_get_current_settings_output_get_ipv4_gateway_subnet_mask(out, &mask, NULL);
             struct in_addr in4 = {.s_addr = htonl(addr)};
             printf("address=%s/%d\n", inet_ntoa(in4), __builtin_popcount(mask));
@@ -261,10 +300,66 @@ int main(int argc, char **argv) {
             print_ipv4("dns", dns);
         if (qmi_message_wds_get_current_settings_output_get_secondary_ipv4_dns_address(out, &dns, NULL))
             print_ipv4("dns", dns);
+
+        /* IPv6 settings */
+        GArray *array6 = NULL;
+        guint8 prefix6 = 0;
+        char buf6[INET6_ADDRSTRLEN];
+        struct in6_addr in6_addr_val;
+        gboolean has_ipv6 = FALSE;
+
+        if (qmi_message_wds_get_current_settings_output_get_ipv6_address(out, &array6, &prefix6, NULL) && array6) {
+            has_ipv6 = TRUE;
+            memset(&in6_addr_val, 0, sizeof(in6_addr_val));
+            for (guint i = 0; i < array6->len && i < 8; i++)
+                ((guint16 *)in6_addr_val.s6_addr)[i] = GUINT16_TO_BE(g_array_index(array6, guint16, i));
+            inet_ntop(AF_INET6, &in6_addr_val, buf6, sizeof(buf6));
+            printf("ipv6_address=%s/%u\n", buf6, prefix6);
+        }
+        if (qmi_message_wds_get_current_settings_output_get_ipv6_gateway_address(out, &array6, &prefix6, NULL) && array6) {
+            memset(&in6_addr_val, 0, sizeof(in6_addr_val));
+            for (guint i = 0; i < array6->len && i < 8; i++)
+                ((guint16 *)in6_addr_val.s6_addr)[i] = GUINT16_TO_BE(g_array_index(array6, guint16, i));
+            inet_ntop(AF_INET6, &in6_addr_val, buf6, sizeof(buf6));
+            printf("gateway=%s\n", buf6);
+        }
+        if (qmi_message_wds_get_current_settings_output_get_ipv6_primary_dns_address(out, &array6, NULL) && array6) {
+            memset(&in6_addr_val, 0, sizeof(in6_addr_val));
+            for (guint i = 0; i < array6->len && i < 8; i++)
+                ((guint16 *)in6_addr_val.s6_addr)[i] = GUINT16_TO_BE(g_array_index(array6, guint16, i));
+            inet_ntop(AF_INET6, &in6_addr_val, buf6, sizeof(buf6));
+            printf("dns=%s\n", buf6);
+        }
+        if (qmi_message_wds_get_current_settings_output_get_ipv6_secondary_dns_address(out, &array6, NULL) && array6) {
+            memset(&in6_addr_val, 0, sizeof(in6_addr_val));
+            for (guint i = 0; i < array6->len && i < 8; i++)
+                ((guint16 *)in6_addr_val.s6_addr)[i] = GUINT16_TO_BE(g_array_index(array6, guint16, i));
+            inet_ntop(AF_INET6, &in6_addr_val, buf6, sizeof(buf6));
+            printf("dns=%s\n", buf6);
+        }
+
+        /* MTU */
         if (qmi_message_wds_get_current_settings_output_get_mtu(out, &mtu, NULL))
             printf("mtu=%u\n", mtu);
 
-        if (has_addr) configure_ipv4(ifname, addr, mask, mtu);
+        /* P-CSCF server addresses (IMS) */
+        GArray *pcscf_list = NULL;
+        if (qmi_message_wds_get_current_settings_output_get_pcscf_server_address_list(out, &pcscf_list, NULL) && pcscf_list) {
+            for (guint i = 0; i < pcscf_list->len; i++) {
+                guint32 pcscf_addr = g_array_index(pcscf_list, guint32, i);
+                struct in_addr in_p = {.s_addr = htonl(pcscf_addr)};
+                printf("pcscf=%s\n", inet_ntoa(in_p));
+            }
+        }
+
+        /* Configure network interface */
+        if (has_ipv4) configure_ipv4(ifname, addr, mask, mtu);
+        if (has_ipv6) {
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd), "ip -6 addr replace %s/%u dev %s", buf6, prefix6, ifname);
+            int res = system(cmd);
+            (void)res;
+        }
         set_iface_up(ifname);
     }
 
