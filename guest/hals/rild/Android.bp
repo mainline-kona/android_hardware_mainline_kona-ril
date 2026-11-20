@@ -38,6 +38,11 @@ cc_binary {
         "liblog",
         "libril-modem-lib",
     ],
+    required: [
+        "libcuttlefish-ril-2",
+        "kona-dataconn",
+        "kona-voicecall",
+    ],
     relative_install_path: "hw",
     init_rc: ["rild-kona.rc"],
     vintf_fragments: ["radio-kona.xml"],
