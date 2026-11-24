@@ -849,38 +849,52 @@ static const char* getRadioInterfaceName()
 }
 
 /*
- * On a real modem behind IPA the data session is set up over QMI by a helper that holds
- * it until SIGTERM. One session at a time, reported as cid 1.
+ * On a real modem, each data session is set up over QMI by kona-dataconn with a
+ * dedicated mux_id (cid 1..MAX_PDP) and held until SIGTERM.
  */
 #define DATACONN_PATH "/vendor/bin/kona-dataconn"
-#define DATACONN_CID 1
 
-static pid_t s_dataconn_pid = -1;
-static char s_dc_type[16], s_dc_ifname[32], s_dc_addr[128], s_dc_gw[128], s_dc_dns[256], s_dc_pcscf[256];
-static int s_dc_mtu;
+struct DataconnSession {
+    pid_t pid;
+    char type[16];
+    char ifname[32];
+    char addr[128];
+    char gw[128];
+    char dns[256];
+    char pcscf[256];
+    int mtu;
+};
+
+static struct DataconnSession s_sessions[MAX_PDP];
 
 static int useDataconn(void) {
     return access(DATACONN_PATH, X_OK) == 0;
 }
 
-static void stopDataconn(void) {
-    if (s_dataconn_pid > 0) {
-        kill(s_dataconn_pid, SIGTERM);
-        waitpid(s_dataconn_pid, NULL, 0);
+static void stopDataconn(int cid) {
+    for (int i = 0; i < MAX_PDP; i++) {
+        if (cid > 0 && (i + 1) != cid) continue;
+        if (s_sessions[i].pid > 0) {
+            kill(s_sessions[i].pid, SIGTERM);
+            waitpid(s_sessions[i].pid, NULL, 0);
+        }
+        s_sessions[i].pid = -1;
     }
-    s_dataconn_pid = -1;
 }
 
-static int dataconnAlive(void) {
-    if (s_dataconn_pid > 0 && waitpid(s_dataconn_pid, NULL, WNOHANG) == s_dataconn_pid) {
-        RLOGE("kona-dataconn exited, data session lost");
-        s_dataconn_pid = -1;
+static int dataconnAlive(int idx) {
+    if (idx < 0 || idx >= MAX_PDP) return 0;
+    if (s_sessions[idx].pid > 0 && waitpid(s_sessions[idx].pid, NULL, WNOHANG) == s_sessions[idx].pid) {
+        RLOGE("kona-dataconn (cid %d) exited, data session lost", idx + 1);
+        s_sessions[idx].pid = -1;
     }
-    return s_dataconn_pid > 0;
+    return s_sessions[idx].pid > 0;
 }
+
+static void sendDataconnCallList(RIL_Token *t);
 
 static void onDataconnExit(void *param __unused) {
-    if (!dataconnAlive()) RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
+    sendDataconnCallList(NULL);
 }
 
 // The helper exits when the modem drops the session; tell Android so it sets up a new one.
@@ -897,7 +911,7 @@ static void *watchDataconn(void *arg) {
     return NULL;
 }
 
-// Returns 0 once the helper reports "ready", filling the s_dc_* settings.
+// Returns cid (1..MAX_PDP) once the helper reports "ready", or -1 on failure.
 static int startDataconn(const char *apn, const char *pdp_type) {
     int fds[2];
     const char *family = "ipv4";
@@ -909,7 +923,19 @@ static int startDataconn(const char *apn, const char *pdp_type) {
         }
     }
 
-    stopDataconn();
+    int slot = -1;
+    for (int i = 0; i < MAX_PDP; i++) {
+        if (!dataconnAlive(i)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        RLOGE("startDataconn: no free PDP slots (MAX_PDP=%d)", MAX_PDP);
+        return -1;
+    }
+
+    int cid = slot + 1;
     if (pipe(fds) < 0) return -1;
 
     pid_t pid = fork();
@@ -919,52 +945,54 @@ static int startDataconn(const char *apn, const char *pdp_type) {
         return -1;
     }
     if (pid == 0) {
+        char mux_str[16];
+        snprintf(mux_str, sizeof(mux_str), "%d", cid);
         dup2(fds[1], STDOUT_FILENO);
         close(fds[0]);
         close(fds[1]);
-        execl(DATACONN_PATH, DATACONN_PATH, apn ? apn : "", family, (char *)NULL);
+        execl(DATACONN_PATH, DATACONN_PATH, apn ? apn : "", family, mux_str, (char *)NULL);
         _exit(127);
     }
     close(fds[1]);
-    s_dataconn_pid = pid;
 
-    s_dc_ifname[0] = s_dc_addr[0] = s_dc_gw[0] = s_dc_dns[0] = s_dc_pcscf[0] = '\0';
-    s_dc_mtu = 0;
-    strlcpy(s_dc_type, (pdp_type && *pdp_type) ? pdp_type : "IP", sizeof(s_dc_type));
+    struct DataconnSession *s = &s_sessions[slot];
+    memset(s, 0, sizeof(*s));
+    s->pid = pid;
+    strlcpy(s->type, (pdp_type && *pdp_type) ? pdp_type : "IP", sizeof(s->type));
 
     FILE *out = fdopen(fds[0], "r");
     char line[256];
     int ready = 0;
     while (out && fgets(line, sizeof(line), out)) {
         line[strcspn(line, "\r\n")] = '\0';
-        RLOGD("kona-dataconn: %s", line);
+        RLOGD("kona-dataconn[cid=%d]: %s", cid, line);
         if (!strcmp(line, "ready")) {
             ready = 1;
             break;
         } else if (!strncmp(line, "ifname=", 7)) {
-            strlcpy(s_dc_ifname, line + 7, sizeof(s_dc_ifname));
+            strlcpy(s->ifname, line + 7, sizeof(s->ifname));
         } else if (!strncmp(line, "address=", 8)) {
-            if (s_dc_addr[0]) strlcat(s_dc_addr, " ", sizeof(s_dc_addr));
-            strlcat(s_dc_addr, line + 8, sizeof(s_dc_addr));
+            if (s->addr[0]) strlcat(s->addr, " ", sizeof(s->addr));
+            strlcat(s->addr, line + 8, sizeof(s->addr));
         } else if (!strncmp(line, "ipv6_address=", 13)) {
-            if (s_dc_addr[0]) strlcat(s_dc_addr, " ", sizeof(s_dc_addr));
-            strlcat(s_dc_addr, line + 13, sizeof(s_dc_addr));
+            if (s->addr[0]) strlcat(s->addr, " ", sizeof(s->addr));
+            strlcat(s->addr, line + 13, sizeof(s->addr));
         } else if (!strncmp(line, "gateway=", 8)) {
-            if (s_dc_gw[0]) strlcat(s_dc_gw, " ", sizeof(s_dc_gw));
-            strlcat(s_dc_gw, line + 8, sizeof(s_dc_gw));
+            if (s->gw[0]) strlcat(s->gw, " ", sizeof(s->gw));
+            strlcat(s->gw, line + 8, sizeof(s->gw));
         } else if (!strncmp(line, "dns=", 4)) {
-            if (s_dc_dns[0]) strlcat(s_dc_dns, " ", sizeof(s_dc_dns));
-            strlcat(s_dc_dns, line + 4, sizeof(s_dc_dns));
+            if (s->dns[0]) strlcat(s->dns, " ", sizeof(s->dns));
+            strlcat(s->dns, line + 4, sizeof(s->dns));
         } else if (!strncmp(line, "pcscf=", 6)) {
-            if (s_dc_pcscf[0]) strlcat(s_dc_pcscf, " ", sizeof(s_dc_pcscf));
-            strlcat(s_dc_pcscf, line + 6, sizeof(s_dc_pcscf));
+            if (s->pcscf[0]) strlcat(s->pcscf, " ", sizeof(s->pcscf));
+            strlcat(s->pcscf, line + 6, sizeof(s->pcscf));
         } else if (!strncmp(line, "mtu=", 4)) {
-            s_dc_mtu = atoi(line + 4);
+            s->mtu = atoi(line + 4);
         }
     }
     if (!ready) {
         if (out) fclose(out); else close(fds[0]);
-        stopDataconn();
+        stopDataconn(cid);
         return -1;
     }
 
@@ -974,33 +1002,37 @@ static int startDataconn(const char *apn, const char *pdp_type) {
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&thread, &attr, watchDataconn, out) != 0) fclose(out);
     pthread_attr_destroy(&attr);
-    return 0;
+    return cid;
 }
 
-static void fillDataconnResponse(RIL_Data_Call_Response_v11 *r) {
+static void fillDataconnResponse(int cid, RIL_Data_Call_Response_v11 *r) {
+    struct DataconnSession *s = &s_sessions[cid - 1];
     r->status = 0;
     r->suggestedRetryTime = -1;
-    r->cid = DATACONN_CID;
+    r->cid = cid;
     r->active = 2;  // link up
-    r->type = s_dc_type;
-    r->ifname = s_dc_ifname;
-    r->addresses = s_dc_addr;
-    r->dnses = s_dc_dns;
-    r->gateways = s_dc_gw;
-    r->pcscf = s_dc_pcscf;
-    r->mtu = s_dc_mtu;
+    r->type = s->type;
+    r->ifname = s->ifname;
+    r->addresses = s->addr;
+    r->dnses = s->dns;
+    r->gateways = s->gw;
+    r->pcscf = s->pcscf;
+    r->mtu = s->mtu;
 }
 
 static void sendDataconnCallList(RIL_Token *t) {
-    RIL_Data_Call_Response_v11 response;
-    int n = dataconnAlive() ? 1 : 0;
-
-    if (n) fillDataconnResponse(&response);
+    RIL_Data_Call_Response_v11 responses[MAX_PDP];
+    int n = 0;
+    for (int i = 0; i < MAX_PDP; i++) {
+        if (dataconnAlive(i)) {
+            fillDataconnResponse(i + 1, &responses[n++]);
+        }
+    }
     if (t != NULL) {
-        RIL_onRequestComplete(*t, RIL_E_SUCCESS, n ? &response : NULL,
+        RIL_onRequestComplete(*t, RIL_E_SUCCESS, n ? responses : NULL,
                               n * sizeof(RIL_Data_Call_Response_v11));
     } else {
-        RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, n ? &response : NULL,
+        RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, n ? responses : NULL,
                                   n * sizeof(RIL_Data_Call_Response_v11));
     }
 }
@@ -2898,134 +2930,107 @@ static void requestSimAuthentication(int authContext, char* authData, RIL_Token 
     response.sw1 = 0x90;
     response.sw2 = 0;
 
-    binAuthData  =
-            (unsigned char *)malloc(sizeof(*binAuthData) * strlen(authData));
+    int binAuthLen = 0;
+    binAuthData = (unsigned char *)malloc(strlen(authData) + 1);
     if (binAuthData == NULL) {
         goto error;
     }
-    if(base64_decode(authData, binAuthData) <= 0) {
+    binAuthLen = base64_decode(authData, binAuthData);
+    if (binAuthLen <= 0) {
         RLOGE("base64_decode failed %s %d", __func__, __LINE__);
         goto error;
     }
-    hexAuthData =
-            (unsigned char *)malloc(strlen(authData) * 2 + sizeof(char));
+    hexAuthData = (unsigned char *)malloc(binAuthLen * 2 + 1);
     if (hexAuthData == NULL) {
         goto error;
     }
-    memset(hexAuthData, 0, strlen(authData) * 2 + sizeof(char));
-    convertBytesToHexString((char *)binAuthData, strlen(authData), hexAuthData);
+    memset(hexAuthData, 0, binAuthLen * 2 + 1);
+    convertBytesToHexString((char *)binAuthData, binAuthLen, hexAuthData);
 
-    randLen = binAuthData[0];
-    rand = (char *)malloc(sizeof(char) * (randLen * 2 + sizeof(char)));
-    if (rand == NULL) {
-        goto error;
+    /* Open logical channel to ISIM (A0000000871004), falling back to USIM (A0000000871002) */
+    int channel = -1;
+    err = at_send_command_singleline("AT+CCHO=\"A0000000871004\"", "+CCHO:", &p_response);
+    if (err < 0 || p_response == NULL || p_response->success == 0) {
+        at_response_free(p_response);
+        p_response = NULL;
+        err = at_send_command_singleline("AT+CCHO=\"A0000000871002\"", "+CCHO:", &p_response);
     }
-    memcpy(rand, hexAuthData + 2, randLen * 2);
-    memcpy(rand + randLen * 2, "\0", 1);
-
-    if (authContext == AUTH_CONTEXT_EAP_AKA) {
-        // There's the autn value to parse as well.
-        autnLen = binAuthData[1 + randLen];
-        autn = (char*)malloc(sizeof(char) * (autnLen * 2 + sizeof(char)));
-        if (autn == NULL) {
-            goto error;
-        }
-        memcpy(autn, hexAuthData + 2 + randLen * 2 + 2, autnLen * 2);
-        memcpy(autn + autnLen * 2, "\0", 1);
-    }
-
-    if (authContext == AUTH_CONTEXT_EAP_SIM) {
-        ret = asprintf(&cmd, "AT^MBAU=\"%s\"", rand);
-    } else {
-        ret = asprintf(&cmd, "AT^MBAU=\"%s,%s\"", rand, autn);
-    }
-    if (ret < 0) {
-        RLOGE("Failed to asprintf");
-        goto error;
-    }
-    err = at_send_command_singleline( cmd, "^MBAU:", &p_response);
-    free(cmd);
-
-    if (err < 0 || p_response->success == 0) {
+    if (err < 0 || p_response == NULL || p_response->success == 0) {
+        RLOGE("requestSimAuthentication: AT+CCHO failed");
         goto error;
     }
     line = p_response->p_intermediates->line;
-    err = at_tok_start(&line);
-    if (err < 0) goto error;
-
-    err = at_tok_nextint(&line, &status);
-    if (err < 0) goto error;
-    if (status != SIM_AUTH_RESPONSE_SUCCESS) {
+    if (at_tok_start(&line) < 0 || at_tok_nextint(&line, &channel) < 0 || channel < 0) {
         goto error;
     }
+    at_response_free(p_response);
+    p_response = NULL;
 
-    if (authContext == AUTH_CONTEXT_EAP_SIM) {
-        err = at_tok_nextstr(&line, &kc);
-        if (err < 0) goto error;
-        kcLen = strlen(kc);
-
-        err = at_tok_nextstr(&line, &sres);
-        if (err < 0) goto error;
-        sresLen = strlen(sres);
-
-        // sresLen + sres + kcLen + kc + '\0'
-        binSimResponseLen = (kcLen + sresLen) / 2 + 3 * sizeof(char);
-        binSimResponse = (unsigned char*)malloc(binSimResponseLen + sizeof(char));
-        if (binSimResponse == NULL) goto error;
-        memset(binSimResponse, 0, binSimResponseLen);
-        // set sresLen and sres
-        binSimResponse[0] = (sresLen / 2) & 0xFF;
-        uint8_t* tmpBinSimResponse = convertHexStringToBytes(sres, sresLen);
-        snprintf((char*)(binSimResponse + 1), sresLen / 2, "%s", tmpBinSimResponse);
-        free(tmpBinSimResponse);
-        tmpBinSimResponse = NULL;
-        // set kcLen and kc
-        binSimResponse[1 + sresLen / 2] = (kcLen / 2) & 0xFF;
-        tmpBinSimResponse = convertHexStringToBytes(kc, kcLen);
-        snprintf((char*)(binSimResponse + 1 + sresLen / 2 + 1), kcLen / 2, "%s", tmpBinSimResponse);
-        free(tmpBinSimResponse);
-        tmpBinSimResponse = NULL;
-    } else {  // AUTH_CONTEXT_EAP_AKA
-        err = at_tok_nextstr(&line, &ck);
-        if (err < 0) goto error;
-        ckLen = strlen(ck);
-
-        err = at_tok_nextstr(&line, &ik);
-        if (err < 0) goto error;
-        ikLen = strlen(ik);
-
-        err = at_tok_nextstr(&line, &resAuts);
-        if (err < 0) goto error;
-        resAutsLen = strlen(resAuts);
-
-        // 0xDB + ckLen + ck + ikLen + ik + resAutsLen + resAuts + '\0'
-        binSimResponseLen = (ckLen + ikLen + resAutsLen) / 2 + 5 * sizeof(char);
-        binSimResponse = (unsigned char*)malloc(binSimResponseLen + sizeof(char));
-        if (binSimResponse == NULL) goto error;
-        memset(binSimResponse, 0, binSimResponseLen);
-        // The DB prefix indicates successful auth. Not produced by the SIM.
-        binSimResponse[0] = 0xDB;
-        // Set ckLen and ck
-        binSimResponse[1] = (ckLen / 2) & 0xFF;
-        uint8_t* tmpBinSimResponse = convertHexStringToBytes(ck, ckLen);
-        snprintf((char*)(binSimResponse + 2), ckLen / 2 + 1, "%s", tmpBinSimResponse);
-        free(tmpBinSimResponse);
-        tmpBinSimResponse = NULL;
-        // Set ikLen and ik
-        binSimResponse[2 + ckLen / 2] = (ikLen / 2) & 0xFF;
-        tmpBinSimResponse = convertHexStringToBytes(ik, ikLen);
-        snprintf((char*)(binSimResponse + 2 + ckLen / 2 + 1), ikLen / 2 + 1, "%s",
-                 tmpBinSimResponse);
-        free(tmpBinSimResponse);
-        tmpBinSimResponse = NULL;
-        // Set resAutsLen and resAuts
-        binSimResponse[2 + ckLen / 2 + 1 + ikLen / 2] = (resAutsLen / 2) & 0xFF;
-        tmpBinSimResponse = convertHexStringToBytes(resAuts, resAutsLen);
-        snprintf((char*)(binSimResponse + 2 + ckLen / 2 + 1 + ikLen / 2 + 1), resAutsLen / 2 + 1,
-                 "%s", tmpBinSimResponse);
-        free(tmpBinSimResponse);
-        tmpBinSimResponse = NULL;
+    int cla = (channel < 4) ? channel : (0x40 | (channel - 4));
+    int p2 = (authContext == AUTH_CONTEXT_EAP_AKA) ? 0x81 : 0x80;
+    int apduHexLen = 10 + binAuthLen * 2;
+    ret = asprintf(&cmd, "AT+CGLA=%d,%d,\"%02X8800%02X%02X%s\"",
+                   channel, apduHexLen, cla, p2, binAuthLen, (char *)hexAuthData);
+    if (ret < 0) {
+        RLOGE("Failed to asprintf AT+CGLA");
+        goto close_channel;
     }
+    err = at_send_command_singleline(cmd, "+CGLA:", &p_response);
+    free(cmd);
+    cmd = NULL;
+
+    if (err < 0 || p_response == NULL || p_response->success == 0) {
+        RLOGE("requestSimAuthentication: AT+CGLA failed");
+        goto close_channel;
+    }
+    line = p_response->p_intermediates->line;
+    if (at_tok_start(&line) < 0) goto close_channel;
+    int respHexLen = 0;
+    char *respHex = NULL;
+    if (at_tok_nextint(&line, &respHexLen) < 0 || at_tok_nextstr(&line, &respHex) < 0) {
+        goto close_channel;
+    }
+    int actualHexLen = (int)strlen(respHex);
+    if (actualHexLen < 4) {
+        goto close_channel;
+    }
+    unsigned int sw1 = 0, sw2 = 0;
+    if (sscanf(respHex + actualHexLen - 4, "%02x%02x", &sw1, &sw2) == 2) {
+        response.sw1 = (int)sw1;
+        response.sw2 = (int)sw2;
+    }
+    int payloadHexLen = actualHexLen - 4;
+    binSimResponseLen = payloadHexLen / 2;
+    if (binSimResponseLen > 0) {
+        binSimResponse = convertHexStringToBytes(respHex, payloadHexLen);
+        if (binSimResponse == NULL) goto close_channel;
+        response.simResponse = (char *)malloc(2 * binSimResponseLen + 4);
+        if (response.simResponse == NULL) goto close_channel;
+        base64_encode(binSimResponse, binSimResponseLen, response.simResponse);
+    } else {
+        response.simResponse = strdup("");
+    }
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+    free(response.simResponse);
+    response.simResponse = NULL;
+    at_response_free(p_response);
+    p_response = NULL;
+    if (channel >= 0 && asprintf(&cmd, "AT+CCHC=%d", channel) >= 0) {
+        at_send_command(cmd, NULL);
+        free(cmd);
+    }
+    free(binSimResponse);
+    free(binAuthData);
+    free(hexAuthData);
+    return;
+
+close_channel:
+    if (channel >= 0 && asprintf(&cmd, "AT+CCHC=%d", channel) >= 0) {
+        at_send_command(cmd, NULL);
+        free(cmd);
+    }
+    goto error;
 
     response.simResponse = (char*)malloc(2 * binSimResponseLen + sizeof(char));
     if (response.simResponse == NULL) goto error;
@@ -3166,7 +3171,8 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
     if (useDataconn()) {
         pdp_type = datalen > 6 * sizeof(char *) ? ((const char **)data)[6] : "IP";
-        if (startDataconn(apn, pdp_type) < 0) {
+        int cid = startDataconn(apn, pdp_type);
+        if (cid < 0) {
             RIL_Data_Call_Response_v11 response = {
                 .status = 0xffff /* PDP_FAIL_ERROR_UNSPECIFIED */,
                 .suggestedRetryTime = -1,
@@ -3179,7 +3185,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
             return;
         }
         RIL_Data_Call_Response_v11 response;
-        fillDataconnResponse(&response);
+        fillDataconnResponse(cid, &response);
         RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
         return;
     }
@@ -3310,7 +3316,7 @@ static void requestDeactivateDataCall(void *data, RIL_Token t)
     RIL_Errno rilErrno = RIL_E_GENERIC_FAILURE;
 
     if (useDataconn()) {
-        stopDataconn();
+        stopDataconn(cid);
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         sendDataconnCallList(NULL);
         return;
