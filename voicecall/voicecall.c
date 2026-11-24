@@ -20,8 +20,8 @@
 #include <tinyalsa/asoundlib.h>
 
 #define CARD 0
-#define KEEPALIVE_RX_DEVICE 1
-#define KEEPALIVE_TX_DEVICE 3
+#define KEEPALIVE_RX_DEVICE 2
+#define KEEPALIVE_TX_DEVICE 2
 
 struct control {
     const char *name;
@@ -30,15 +30,10 @@ struct control {
 };
 
 static const struct control kControls[] = {
-    {"TERTIARY_MI2S_RX Audio Mixer MultiMedia2", "1", "0"},
-    {"MultiMedia4 Mixer TX_CODEC_DMA_TX_3", "1", "0"},
-    {"ADC1_MIXER Switch", "1", "0"},
-    {"ADC1 Switch", "1", "0"},
-    {"TX0 MODE", "ADC_NORMAL", "ADC_INVALID"},
-    {"TX DEC0 MUX", "SWR_MIC", NULL},
-    {"TX SMIC MUX0", "SWR_MIC0", "ZERO"},
-    {"TX_AIF1_CAP Mixer DEC0", "1", "0"},
-    {"TX_DEC0 Volume", "100", NULL},
+    {"TERT_MI2S_RX_Voice Mixer VoiceMMode1", "1", "0"},
+    {"RX_CDC_DMA_RX_0_Voice Mixer VoiceMMode1", "1", "0"},
+    {"VoiceMMode1_Tx Mixer TX_CDC_DMA_TX_3_MMode1", "1", "0"},
+    {"VoiceMMode1_Tx Mixer TX_CDC_DMA_TX_4_MMode1", "1", "0"},
 };
 
 static volatile sig_atomic_t stop;
