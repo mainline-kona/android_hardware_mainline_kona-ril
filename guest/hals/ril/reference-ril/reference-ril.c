@@ -856,7 +856,7 @@ static const char* getRadioInterfaceName()
 #define DATACONN_CID 1
 
 static pid_t s_dataconn_pid = -1;
-static char s_dc_type[16], s_dc_ifname[32], s_dc_addr[64], s_dc_gw[64], s_dc_dns[160];
+static char s_dc_type[16], s_dc_ifname[32], s_dc_addr[128], s_dc_gw[128], s_dc_dns[256], s_dc_pcscf[256];
 static int s_dc_mtu;
 
 static int useDataconn(void) {
@@ -900,7 +900,14 @@ static void *watchDataconn(void *arg) {
 // Returns 0 once the helper reports "ready", filling the s_dc_* settings.
 static int startDataconn(const char *apn, const char *pdp_type) {
     int fds[2];
-    const char *family = (pdp_type && !strcmp(pdp_type, "IPV6")) ? "ipv6" : "ipv4";
+    const char *family = "ipv4";
+    if (pdp_type) {
+        if (!strcmp(pdp_type, "IPV6")) {
+            family = "ipv6";
+        } else if (!strcmp(pdp_type, "IPV4V6")) {
+            family = "ipv4v6";
+        }
+    }
 
     stopDataconn();
     if (pipe(fds) < 0) return -1;
@@ -921,7 +928,7 @@ static int startDataconn(const char *apn, const char *pdp_type) {
     close(fds[1]);
     s_dataconn_pid = pid;
 
-    s_dc_ifname[0] = s_dc_addr[0] = s_dc_gw[0] = s_dc_dns[0] = '\0';
+    s_dc_ifname[0] = s_dc_addr[0] = s_dc_gw[0] = s_dc_dns[0] = s_dc_pcscf[0] = '\0';
     s_dc_mtu = 0;
     strlcpy(s_dc_type, (pdp_type && *pdp_type) ? pdp_type : "IP", sizeof(s_dc_type));
 
@@ -937,12 +944,20 @@ static int startDataconn(const char *apn, const char *pdp_type) {
         } else if (!strncmp(line, "ifname=", 7)) {
             strlcpy(s_dc_ifname, line + 7, sizeof(s_dc_ifname));
         } else if (!strncmp(line, "address=", 8)) {
-            strlcpy(s_dc_addr, line + 8, sizeof(s_dc_addr));
+            if (s_dc_addr[0]) strlcat(s_dc_addr, " ", sizeof(s_dc_addr));
+            strlcat(s_dc_addr, line + 8, sizeof(s_dc_addr));
+        } else if (!strncmp(line, "ipv6_address=", 13)) {
+            if (s_dc_addr[0]) strlcat(s_dc_addr, " ", sizeof(s_dc_addr));
+            strlcat(s_dc_addr, line + 13, sizeof(s_dc_addr));
         } else if (!strncmp(line, "gateway=", 8)) {
-            strlcpy(s_dc_gw, line + 8, sizeof(s_dc_gw));
+            if (s_dc_gw[0]) strlcat(s_dc_gw, " ", sizeof(s_dc_gw));
+            strlcat(s_dc_gw, line + 8, sizeof(s_dc_gw));
         } else if (!strncmp(line, "dns=", 4)) {
             if (s_dc_dns[0]) strlcat(s_dc_dns, " ", sizeof(s_dc_dns));
             strlcat(s_dc_dns, line + 4, sizeof(s_dc_dns));
+        } else if (!strncmp(line, "pcscf=", 6)) {
+            if (s_dc_pcscf[0]) strlcat(s_dc_pcscf, " ", sizeof(s_dc_pcscf));
+            strlcat(s_dc_pcscf, line + 6, sizeof(s_dc_pcscf));
         } else if (!strncmp(line, "mtu=", 4)) {
             s_dc_mtu = atoi(line + 4);
         }
@@ -972,7 +987,7 @@ static void fillDataconnResponse(RIL_Data_Call_Response_v11 *r) {
     r->addresses = s_dc_addr;
     r->dnses = s_dc_dns;
     r->gateways = s_dc_gw;
-    r->pcscf = "";
+    r->pcscf = s_dc_pcscf;
     r->mtu = s_dc_mtu;
 }
 
