@@ -51,7 +51,7 @@ cc_library {
         "reference-ril.c",
     ],
     include_dirs: [
-        "device/nothing/phone2_mainline/radio",
+        "hardware/mainline/kona-ril",
     ],
     shared_libs: [
         "libbase",

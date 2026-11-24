@@ -40,7 +40,7 @@ cc_library {
         "sap_service.cpp",
     ],
     include_dirs: [
-        "device/nothing/phone2_mainline/radio",
+        "hardware/mainline/kona-ril",
         "hardware/ril/include",
     ],
     shared_libs: [

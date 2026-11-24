@@ -29,7 +29,7 @@ cc_binary {
         "rild_cuttlefish.c",
     ],
     include_dirs: [
-        "device/nothing/phone2_mainline/radio",
+        "hardware/mainline/kona-ril",
         "hardware/ril/include",
     ],
     shared_libs: [
@@ -37,6 +37,11 @@ cc_binary {
         "libdl",
         "liblog",
         "libril-modem-lib",
+    ],
+    required: [
+        "libcuttlefish-ril-2",
+        "kona-dataconn",
+        "kona-voicecall",
     ],
     relative_install_path: "hw",
     init_rc: ["rild-kona.rc"],

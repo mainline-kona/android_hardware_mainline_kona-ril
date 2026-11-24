@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-# The first AT port rejects most configuration commands, the second takes them
-service vendor.ril-daemon /vendor/bin/hw/libcuttlefish-rild -l libcuttlefish-ril-2.so -- -d /dev/wwan0at1
+# On Kona (OnePlus 8T SDX55), MHI Channel 32 (DUN) is exposed as /dev/wwan0at0
+service vendor.ril-daemon /vendor/bin/hw/libcuttlefish-rild -l libcuttlefish-ril-2.so -- -d /dev/wwan0at0
     class main
     user radio
     group radio inet misc audio log readproc wakelock
