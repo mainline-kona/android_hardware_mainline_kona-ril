@@ -5689,6 +5689,10 @@ RIL_CellInfoType getCellInfoTypeRadioTechnology(char *rat) {
             return RIL_CELL_INFO_TYPE_TD_SCDMA;
         }
 
+        case RADIO_TECH_NR: {
+            return RIL_CELL_INFO_TYPE_NR;
+        }
+
         default: {
             break;
         }
@@ -5824,7 +5828,7 @@ void fillCellIdentityResponse_1_5(V1_5::CellIdentity &cellIdentity,
 
         case RIL_CELL_INFO_TYPE_LTE: {
             V1_5::CellIdentityLte lte;
-            lte.base.base.mcc = std::to_string(rilCellIdentity.cellIdentityGsm.mcc);
+            lte.base.base.mcc = std::to_string(rilCellIdentity.cellIdentityLte.mcc);
             lte.base.base.mnc = ril::util::mnc::decode(rilCellIdentity.cellIdentityLte.mnc);
             if (lte.base.base.mcc == "-1") {
                 lte.base.base.mcc = "";
@@ -6072,13 +6076,30 @@ void fillCellIdentityFromVoiceRegStateResponseString(V1_5::CellIdentity &cellIde
                     convertResponseHexStringEntryToInt(response, 2, numStrings);
 
             if (numStrings > 15) {
-                rilCellIdentity.cellIdentityGsm.mcc =
+                rilCellIdentity.cellIdentityLte.mcc =
                         convertResponseStringEntryToInt(response, 15, numStrings);
 
-                rilCellIdentity.cellIdentityGsm.mnc =
+                rilCellIdentity.cellIdentityLte.mnc =
                         convertResponseStringEntryToInt(response, 16, numStrings);
             }
             break;
+        }
+
+        case RIL_CELL_INFO_TYPE_NR: {
+            V1_5::CellIdentityNr nr;
+            int mcc = (numStrings > 15)
+                    ? convertResponseStringEntryToInt(response, 15, numStrings) : -1;
+            int mnc = (numStrings > 15)
+                    ? convertResponseStringEntryToInt(response, 16, numStrings) : -1;
+            nr.base.mcc = (mcc >= 0) ? std::to_string(mcc) : "";
+            nr.base.mnc = (mnc >= 0) ? ril::util::mnc::decode(mnc) : "";
+            nr.base.tac = convertResponseHexStringEntryToInt(response, 1, numStrings);
+            nr.base.nci = (numStrings > 2 && response[2] != NULL)
+                    ? strtoull(response[2], NULL, 16) : INT64_MAX;
+            nr.base.pci = INT_MAX;
+            nr.base.nrarfcn = INT_MAX;
+            cellIdentity.nr(nr);
+            return;
         }
 
         default: {
@@ -6281,10 +6302,18 @@ void fillCellIdentityFromDataRegStateResponseString_1_5(V1_5::CellIdentity &cell
         case RIL_CELL_INFO_TYPE_LTE: {
             rilCellIdentity.cellIdentityLte.tac =
                     convertResponseStringEntryToInt(response, 6, numStrings);
+            if (rilCellIdentity.cellIdentityLte.tac == -1) {
+                rilCellIdentity.cellIdentityLte.tac =
+                        convertResponseHexStringEntryToInt(response, 1, numStrings);
+            }
             rilCellIdentity.cellIdentityLte.pci =
                     convertResponseStringEntryToInt(response, 7, numStrings);
             rilCellIdentity.cellIdentityLte.ci =
                     convertResponseStringEntryToInt(response, 8, numStrings);
+            if (rilCellIdentity.cellIdentityLte.ci == -1) {
+                rilCellIdentity.cellIdentityLte.ci =
+                        convertResponseHexStringEntryToInt(response, 2, numStrings);
+            }
 
             if (numStrings >= 13) {
                 rilCellIdentity.cellIdentityLte.mcc =
@@ -6298,6 +6327,22 @@ void fillCellIdentityFromDataRegStateResponseString_1_5(V1_5::CellIdentity &cell
                 rilCellIdentity.cellIdentityLte.mcc = 0;
             }
             break;
+        }
+        case RIL_CELL_INFO_TYPE_NR: {
+            V1_5::CellIdentityNr nr;
+            int mcc = (numStrings >= 13)
+                    ? convertResponseStringEntryToInt(response, 11, numStrings) : 0;
+            int mnc = (numStrings >= 13)
+                    ? convertResponseStringEntryToInt(response, 12, numStrings) : 0;
+            nr.base.mcc = (mcc >= 0) ? std::to_string(mcc) : "";
+            nr.base.mnc = (mnc >= 0) ? ril::util::mnc::decode(mnc) : "";
+            nr.base.tac = convertResponseHexStringEntryToInt(response, 1, numStrings);
+            nr.base.nci = (numStrings > 2 && response[2] != NULL)
+                    ? strtoull(response[2], NULL, 16) : INT64_MAX;
+            nr.base.pci = INT_MAX;
+            nr.base.nrarfcn = INT_MAX;
+            cellIdentity.nr(nr);
+            return;
         }
         default: {
             break;
@@ -6384,10 +6429,18 @@ void fillCellIdentityFromDataRegStateResponseString_1_2(V1_2::CellIdentity &cell
         case RIL_CELL_INFO_TYPE_LTE: {
             rilCellIdentity.cellIdentityLte.tac =
                     convertResponseStringEntryToInt(response, 6, numStrings);
+            if (rilCellIdentity.cellIdentityLte.tac == -1) {
+                rilCellIdentity.cellIdentityLte.tac =
+                        convertResponseHexStringEntryToInt(response, 1, numStrings);
+            }
             rilCellIdentity.cellIdentityLte.pci =
                     convertResponseStringEntryToInt(response, 7, numStrings);
             rilCellIdentity.cellIdentityLte.ci =
                     convertResponseStringEntryToInt(response, 8, numStrings);
+            if (rilCellIdentity.cellIdentityLte.ci == -1) {
+                rilCellIdentity.cellIdentityLte.ci =
+                        convertResponseHexStringEntryToInt(response, 2, numStrings);
+            }
 
             if (numStrings >= 13) {
                 rilCellIdentity.cellIdentityLte.mcc =
@@ -11160,17 +11213,17 @@ hidl_vec<hidl_string> split(hidl_string str) {
 }
 
 ::android::hardware::radio::V1_4::PdpProtocolType convertToPdpProtocolType(hidl_string str) {
-    if (strncmp("IP", str.c_str(), 2) == 0) {
-        return ::android::hardware::radio::V1_4::PdpProtocolType::IP;
-    } else if (strncmp("IPV6", str.c_str(), 4) == 0) {
-        return ::android::hardware::radio::V1_4::PdpProtocolType::IPV6;
-    } else if (strncmp("IPV4V6", str.c_str(), 6) == 0) {
+    if (strcmp("IPV4V6", str.c_str()) == 0) {
         return ::android::hardware::radio::V1_4::PdpProtocolType::IPV4V6;
-    } else if (strncmp("PPP", str.c_str(), 3) == 0) {
+    } else if (strcmp("IPV6", str.c_str()) == 0) {
+        return ::android::hardware::radio::V1_4::PdpProtocolType::IPV6;
+    } else if (strcmp("IP", str.c_str()) == 0) {
+        return ::android::hardware::radio::V1_4::PdpProtocolType::IP;
+    } else if (strcmp("PPP", str.c_str()) == 0) {
         return ::android::hardware::radio::V1_4::PdpProtocolType::PPP;
-    } else if (strncmp("NON_IP", str.c_str(), 6) == 0) {
+    } else if (strcmp("NON_IP", str.c_str()) == 0) {
         return ::android::hardware::radio::V1_4::PdpProtocolType::NON_IP;
-    } else if (strncmp("UNSTRUCTURED", str.c_str(), 12) == 0) {
+    } else if (strcmp("UNSTRUCTURED", str.c_str()) == 0) {
         return ::android::hardware::radio::V1_4::PdpProtocolType::UNSTRUCTURED;
     } else {
         return ::android::hardware::radio::V1_4::PdpProtocolType::UNKNOWN;

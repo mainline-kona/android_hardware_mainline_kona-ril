@@ -43,8 +43,14 @@
 #include <stdbool.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <linux/qrtr.h>
 #include <linux/vm_sockets.h>
 #include <arpa/inet.h>
+#include <limits.h>
+
+#ifndef AF_QIPCRTR
+#define AF_QIPCRTR 42
+#endif
 
 #include "guest/hals/ril/reference-libril/ril.h"
 #define LOG_TAG "RIL"
@@ -1591,7 +1597,211 @@ static void requestHangup(void *data, size_t datalen __unused, RIL_Token t)
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
-// Fills a RIL_SignalStrength_v12-sized int array from +CSQ. Returns 0 on success.
+static void initEmptySignalStrength(RIL_SignalStrength_v12 *ss)
+{
+    memset(ss, 0, sizeof(*ss));
+    ss->GW_SignalStrength.signalStrength = 99;
+    ss->GW_SignalStrength.bitErrorRate = 99;
+    ss->CDMA_SignalStrength.dbm = -1;
+    ss->CDMA_SignalStrength.ecio = -1;
+    ss->EVDO_SignalStrength.dbm = -1;
+    ss->EVDO_SignalStrength.ecio = -1;
+    ss->EVDO_SignalStrength.signalNoiseRatio = -1;
+    ss->LTE_SignalStrength.signalStrength = 99;
+    ss->LTE_SignalStrength.rsrp = INT_MAX;
+    ss->LTE_SignalStrength.rsrq = INT_MAX;
+    ss->LTE_SignalStrength.rssnr = INT_MAX;
+    ss->LTE_SignalStrength.cqi = INT_MAX;
+    ss->LTE_SignalStrength.timingAdvance = INT_MAX;
+    ss->TD_SCDMA_SignalStrength.rscp = INT_MAX;
+    ss->WCDMA_SignalStrength.signalStrength = 99;
+    ss->WCDMA_SignalStrength.bitErrorRate = 99;
+    ss->NR_SignalStrength.ssRsrp = INT_MAX;
+    ss->NR_SignalStrength.ssRsrq = INT_MAX;
+    ss->NR_SignalStrength.ssSinr = INT_MAX;
+    ss->NR_SignalStrength.csiRsrp = INT_MAX;
+    ss->NR_SignalStrength.csiRsrq = INT_MAX;
+    ss->NR_SignalStrength.csiSinr = INT_MAX;
+}
+
+static uint32_t s_qmiNasNode = 0;
+static uint32_t s_qmiNasPort = 0;
+static int s_qmiNasResolved = 0;
+static uint16_t s_qmiNasTxn = 1;
+
+static int qmiLookupNas(uint32_t *out_node, uint32_t *out_port)
+{
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_qrtr local;
+    socklen_t sl = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &sl) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_qrtr ctrl = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = local.sq_node,
+        .sq_port = QRTR_PORT_CTRL,
+    };
+    struct qrtr_ctrl_pkt req;
+    memset(&req, 0, sizeof(req));
+    req.cmd = QRTR_TYPE_NEW_LOOKUP;
+    req.server.service = 3; /* QMI_SERVICE_NAS */
+    req.server.instance = 0;
+
+    if (sendto(fd, &req, sizeof(req), 0, (struct sockaddr *)&ctrl, sizeof(ctrl)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    int found = 0;
+    for (;;) {
+        struct qrtr_ctrl_pkt resp;
+        ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+        if (n < (ssize_t)sizeof(resp)) break;
+        if (resp.cmd == QRTR_TYPE_NEW_SERVER) {
+            if (resp.server.service == 0 && resp.server.node == 0 && resp.server.port == 0)
+                break;
+            if (resp.server.service == 3) {
+                *out_node = resp.server.node;
+                *out_port = resp.server.port;
+                found = 1;
+            }
+        }
+    }
+    close(fd);
+    return found ? 0 : -1;
+}
+
+static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
+{
+    if (!s_qmiNasResolved) {
+        if (qmiLookupNas(&s_qmiNasNode, &s_qmiNasPort) < 0) {
+            return -1;
+        }
+        s_qmiNasResolved = 1;
+        RLOGI("QMI NAS resolved at QRTR node=%u port=%u", s_qmiNasNode, s_qmiNasPort);
+    }
+
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_qrtr dst = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = s_qmiNasNode,
+        .sq_port = s_qmiNasPort,
+    };
+
+    uint16_t txn = s_qmiNasTxn++;
+    if (s_qmiNasTxn == 0) s_qmiNasTxn = 1;
+    uint8_t req[7] = {
+        0x00,
+        (uint8_t)(txn & 0xff),
+        (uint8_t)((txn >> 8) & 0xff),
+        0x4f, 0x00, /* QMI_NAS_GET_SIGNAL_INFO */
+        0x00, 0x00,
+    };
+
+    if (sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        close(fd);
+        s_qmiNasResolved = 0;
+        return -1;
+    }
+
+    uint8_t buf[512];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    close(fd);
+    if (n < 7) {
+        s_qmiNasResolved = 0;
+        return -1;
+    }
+    uint16_t msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
+    if (msg_id != 0x004f) {
+        return -1;
+    }
+
+    initEmptySignalStrength(ss);
+    int got_any = 0;
+    size_t pos = 7;
+    while (pos + 3 <= (size_t)n) {
+        uint8_t t = buf[pos];
+        uint16_t l = (uint16_t)(buf[pos + 1] | (buf[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > (size_t)n) break;
+
+        if (t == 0x12 && l >= 1) {
+            /* GSM RSSI (dBm) */
+            int8_t rssi = (int8_t)buf[pos];
+            if (rssi <= -51 && rssi >= -113) {
+                ss->GW_SignalStrength.signalStrength = (rssi + 113) / 2;
+                got_any = 1;
+            }
+        } else if (t == 0x13 && l >= 3) {
+            /* WCDMA RSSI (dBm) */
+            int8_t rssi = (int8_t)buf[pos];
+            if (rssi <= -51 && rssi >= -113) {
+                ss->WCDMA_SignalStrength.signalStrength = (rssi + 113) / 2;
+                got_any = 1;
+            }
+        } else if (t == 0x14 && l >= 6) {
+            /* LTE: int8 rssi, int8 rsrq, int16 rsrp, int16 snr (0.1 dB) */
+            int8_t rssi = (int8_t)buf[pos];
+            int8_t rsrq = (int8_t)buf[pos + 1];
+            int16_t rsrp = (int16_t)(buf[pos + 2] | (buf[pos + 3] << 8));
+            int16_t snr = (int16_t)(buf[pos + 4] | (buf[pos + 5] << 8));
+            if (rssi <= -51 && rssi >= -113) {
+                ss->LTE_SignalStrength.signalStrength = (rssi + 113) / 2;
+                got_any = 1;
+            }
+            if (rsrp <= -44 && rsrp >= -140) {
+                ss->LTE_SignalStrength.rsrp = -rsrp;
+                got_any = 1;
+            }
+            if (rsrq <= -3 && rsrq >= -20) {
+                ss->LTE_SignalStrength.rsrq = -rsrq;
+                got_any = 1;
+            }
+            if (snr >= -200 && snr <= 300) {
+                ss->LTE_SignalStrength.rssnr = snr;
+                got_any = 1;
+            }
+        } else if (t == 0x17 && l >= 4) {
+            /* 5G NR: int16 rsrp (dBm), int16 snr (0.1 dB); INT16_MIN = invalid */
+            int16_t rsrp = (int16_t)(buf[pos] | (buf[pos + 1] << 8));
+            int16_t snr = (int16_t)(buf[pos + 2] | (buf[pos + 3] << 8));
+            if (rsrp != INT16_MIN && rsrp <= -44 && rsrp >= -140) {
+                ss->NR_SignalStrength.ssRsrp = -rsrp;
+                got_any = 1;
+            }
+            if (snr != INT16_MIN && snr >= -230 && snr <= 400) {
+                ss->NR_SignalStrength.ssSinr = snr / 10;
+                got_any = 1;
+            }
+        } else if (t == 0x18 && l >= 2) {
+            /* 5G NR Extended: int16 rsrq (dB); INT16_MIN = invalid */
+            int16_t rsrq = (int16_t)(buf[pos] | (buf[pos + 1] << 8));
+            if (rsrq != INT16_MIN && rsrq <= -3 && rsrq >= -20) {
+                ss->NR_SignalStrength.ssRsrq = -rsrq;
+                got_any = 1;
+            }
+        }
+        pos += l;
+    }
+
+    return got_any ? 0 : -1;
+}
+
+// Fills a RIL_SignalStrength_v12-sized int array from QMI NAS (preferred for LTE/5G NR)
+// or falls back to AT+CSQ. Returns 0 on success.
 static int readSignalStrength(int *response, int maxNumOfElements)
 {
     ATResponse *p_response = NULL;
@@ -1600,8 +1810,15 @@ static int readSignalStrength(int *response, int maxNumOfElements)
     int count = 0;
     // Accept a response that is at least v6, and up to v12
     int minNumOfElements=sizeof(RIL_SignalStrength_v6)/sizeof(int);
+    RIL_SignalStrength_v12 ss;
 
     memset(response, 0, maxNumOfElements * sizeof(int));
+
+    if (readQmiNasSignalStrength(&ss) == 0) {
+        memcpy(response, &ss, sizeof(ss) < maxNumOfElements * sizeof(int)
+                ? sizeof(ss) : maxNumOfElements * sizeof(int));
+        return 0;
+    }
 
     // TODO(b/206814247): Rename AT+CSQ command.
     err = at_send_command_singleline("AT+CSQ", "+CSQ:", &p_response);
@@ -1619,22 +1836,16 @@ static int readSignalStrength(int *response, int maxNumOfElements)
 
     if (count < minNumOfElements) {
         // A real modem only gives <rssi>,<ber>; fill GSM, WCDMA and LTE from it
-        RIL_SignalStrength_v12 ss;
         int rssi, ber, rssi_dbm, rsrp;
         if (count < 2) goto error;
         rssi = response[0];
         ber = response[1];
-        memset(&ss, 0xff, sizeof(ss));
+        initEmptySignalStrength(&ss);
         ss.GW_SignalStrength.signalStrength = rssi;
         ss.GW_SignalStrength.bitErrorRate = ber;
         ss.WCDMA_SignalStrength.signalStrength = rssi;
         ss.WCDMA_SignalStrength.bitErrorRate = ber;
         ss.LTE_SignalStrength.signalStrength = rssi;
-        ss.LTE_SignalStrength.rsrp = INT_MAX;
-        ss.LTE_SignalStrength.rsrq = INT_MAX;
-        ss.LTE_SignalStrength.rssnr = INT_MAX;
-        ss.LTE_SignalStrength.cqi = INT_MAX;
-        ss.LTE_SignalStrength.timingAdvance = INT_MAX;
         if (rssi >= 0 && rssi <= 31) {
             // RSRP sits roughly 20 dB under the wideband RSSI on a loaded LTE carrier
             rssi_dbm = -113 + 2 * rssi;
@@ -1668,8 +1879,9 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused, 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
 }
 
-// A real modem never reports +CSQ on its own, so push it to the framework periodically
+// A real modem never reports +CSQ on its own, so push signal strength periodically
 static const struct timeval TIMEVAL_SIGNALPOLL = {10, 0};
+static int s_signalPollStarted = 0;
 
 static void pollSignalStrength(void *param __unused)
 {
@@ -1680,11 +1892,7 @@ static void pollSignalStrength(void *param __unused)
             readSignalStrength(response, maxNumOfElements) == 0) {
         RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
     }
-    static int s_signalPollStarted;
-    if (!s_signalPollStarted) {
-        s_signalPollStarted = 1;
-        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
-    }
+    RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
 }
 
 /**
@@ -2078,6 +2286,8 @@ error:
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
+static uint64_t s_cid64 = 0;
+
 static int parseRegistrationState(char *str, int *type, int *items, int **response)
 {
     int err;
@@ -2085,34 +2295,15 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
     int *resp = NULL;
     int skip;
     int commas;
+    int out_items = 0;
 
     s_lac = -1;
     s_cid = -1;
+    s_cid64 = 0;
 
     RLOGD("parseRegistrationState. Parsing: %s",str);
     err = at_tok_start(&line);
     if (err < 0) goto error;
-
-    /* Ok you have to be careful here
-     * The solicited version of the CREG response is
-     * +CREG: n, stat, [lac, cid]
-     * and the unsolicited version is
-     * +CREG: stat, [lac, cid]
-     * The <n> parameter is basically "is unsolicited creg on?"
-     * which it should always be
-     *
-     * Now we should normally get the solicited version here,
-     * but the unsolicited version could have snuck in
-     * so we have to handle both
-     *
-     * Also since the LAC and CID are only reported when registered,
-     * we can have 1, 2, 3, or 4 arguments here
-     *
-     * finally, a +CGREG: answer may have a fifth value that corresponds
-     * to the network type, as in;
-     *
-     *   +CGREG: n, stat [,lac, cid [,networkType]]
-     */
 
     /* count number of commas */
     commas = 0;
@@ -2120,12 +2311,13 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
         if (*p == ',') commas++;
     }
 
-    resp = (int *)calloc(commas + 1, sizeof(int));
+    resp = (int *)calloc(commas + 4, sizeof(int));
     if (!resp) goto error;
     switch (commas) {
         case 0: /* +CREG: <stat> */
             err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
+            out_items = 1;
             break;
 
         case 1: /* +CREG: <n>, <stat> */
@@ -2133,6 +2325,7 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
             if (err < 0) goto error;
             err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
+            out_items = 1;
             break;
 
         case 2: /* +CREG: <stat>, <lac>, <cid> */
@@ -2140,9 +2333,16 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
             if (err < 0) goto error;
             err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &resp[2]);
-            if (err < 0) goto error;
-        break;
+            {
+                char *cid_str = NULL;
+                err = at_tok_nextstr(&line, &cid_str);
+                if (err < 0 || !cid_str) goto error;
+                s_cid64 = strtoull(cid_str, NULL, 16);
+                resp[2] = (int)s_cid64;
+            }
+            out_items = 3;
+            break;
+
         case 3: /* +CREG: <n>, <stat>, <lac>, <cid> */
             err = at_tok_nextint(&line, &skip);
             if (err < 0) goto error;
@@ -2150,29 +2350,37 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
             if (err < 0) goto error;
             err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &resp[2]);
-            if (err < 0) goto error;
-        break;
-        /* special case for CGREG, there is a fourth parameter
-         * that is the network type (unknown/gprs/edge/umts)
-         */
-        case 4: /* +CGREG: <n>, <stat>, <lac>, <cid>, <networkType> */
+            {
+                char *cid_str = NULL;
+                err = at_tok_nextstr(&line, &cid_str);
+                if (err < 0 || !cid_str) goto error;
+                s_cid64 = strtoull(cid_str, NULL, 16);
+                resp[2] = (int)s_cid64;
+            }
+            out_items = 3;
+            break;
+
+        default: /* +CGREG/+CEREG/+C5GREG: <n>, <stat>, <lac/tac>, <cid/nci>, <AcT> [, ...] */
             err = at_tok_nextint(&line, &skip);
             if (err < 0) goto error;
             err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
             err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &resp[2]);
-            if (err < 0) goto error;
+            {
+                char *cid_str = NULL;
+                err = at_tok_nextstr(&line, &cid_str);
+                if (err < 0 || !cid_str) goto error;
+                s_cid64 = strtoull(cid_str, NULL, 16);
+                resp[2] = (int)s_cid64;
+            }
             err = at_tok_nextint(&line, &resp[3]);
             if (err < 0) goto error;
-        break;
-        default:
-            goto error;
+            out_items = 4;
+            break;
     }
 
-    if (commas >= 2) {
+    if (out_items >= 3) {
         s_lac = resp[1];
         s_cid = resp[2];
     }
@@ -2180,7 +2388,7 @@ static int parseRegistrationState(char *str, int *type, int *items, int **respon
     if (response)
         *response = resp;
     if (items)
-        *items = commas + 1;
+        *items = out_items;
     if (type)
         *type = techFromModemType(TECH(sMdmInfo));
     return 0;
@@ -2311,9 +2519,10 @@ static void requestRegistrationState(int request, void *data __unused,
 
     if (parseRegistrationState(line, &type, &count, &registration)) goto error;
 
-    // On LTE/5G SA a real modem leaves +CGREG unregistered and reports the bearer in +CEREG or +C5GREG
-    if (request == RIL_REQUEST_DATA_REGISTRATION_STATE && registration[0] != 1 &&
-            registration[0] != 5 && strcmp(cmd, "AT+CEREG?") != 0) {
+    // On LTE/5G-only networks (e.g. Jio) a real modem leaves +CREG/+CGREG unregistered
+    // and reports the active EPS/5GS bearer in +CEREG or +C5GREG.
+    uint64_t cid64 = s_cid64;
+    if (registration[0] != 1 && registration[0] != 5 && strcmp(cmd, "AT+CEREG?") != 0) {
         ATResponse *p_eps = NULL;
         int *eps = NULL, eps_type, eps_count = 3;
         err = at_send_command_singleline("AT+CEREG?", "+CEREG:", &p_eps);
@@ -2326,6 +2535,7 @@ static void requestRegistrationState(int request, void *data __unused,
                 eps = NULL;
                 type = eps_type;
                 count = eps_count;
+                cid64 = s_cid64;
             }
         }
         free(eps);
@@ -2344,6 +2554,7 @@ static void requestRegistrationState(int request, void *data __unused,
                 nr = NULL;
                 type = nr_type;
                 count = nr_count;
+                cid64 = s_cid64;
             }
         }
         free(nr);
@@ -2385,7 +2596,7 @@ static void requestRegistrationState(int request, void *data __unused,
             asprintf(&responseStr[1], "%x", registration[1]);
         }
         if (count > 2) {
-            asprintf(&responseStr[2], "%x", registration[2]);
+            asprintf(&responseStr[2], "%" PRIx64, cid64);
         }
         if (count > 3) {
             act = registration[3];
@@ -6344,7 +6555,10 @@ static void initializeCallback(void *param __unused)
         setRadioState (RADIO_STATE_ON);
     }
 
-    RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
+    if (!s_signalPollStarted) {
+        s_signalPollStarted = 1;
+        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
+    }
 }
 
 static void waitForClose()
