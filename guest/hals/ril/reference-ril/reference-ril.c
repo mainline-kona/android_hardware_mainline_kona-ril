@@ -3852,58 +3852,74 @@ void convertBytesToHex(uint8_t *bytes, int length, uint8_t *hex_str) {
 #define USIM_FILE_SIZE_TAG                      0x80
 
 bool convertUsimToSim(uint8_t *byteUSIM, int len, uint8_t *hexSIM) {
-    int desIndex = 0;
-    int sizeIndex = 0;
-    int i = 0;
+    int desIndex = -1;
+    int sizeIndex = -1;
     uint8_t byteSIM[RESPONSE_EF_SIZE] = {0};
-    for (i = 0; i < len; i++) {
-        if (byteUSIM[i] == USIM_FILE_DES_TAG) {
+
+    if (byteUSIM == NULL || len < 4 || byteUSIM[0] != 0x62) {
+        return false;
+    }
+
+    int fcpEnd = 2 + byteUSIM[1];
+    if (fcpEnd > len) {
+        RLOGW("convertUsimToSim: truncated FCP (have %d, expected %d)", len, fcpEnd);
+        return false;
+    }
+
+    for (int i = 2; i + 2 <= fcpEnd;) {
+        uint8_t tag = byteUSIM[i];
+        uint8_t tlen = byteUSIM[i + 1];
+        if (i + 2 + tlen > fcpEnd) {
+            break;
+        }
+        if (tag == USIM_FILE_DES_TAG && tlen >= 1 && desIndex < 0) {
             desIndex = i;
-            break;
-        }
-    }
-    for (i = desIndex; i < len;) {
-        if (byteUSIM[i] == USIM_FILE_SIZE_TAG) {
+        } else if (tag == USIM_FILE_SIZE_TAG && tlen >= 1 && sizeIndex < 0) {
             sizeIndex = i;
-            break;
-        } else {
-            i += (byteUSIM[i + 1] + 2);
         }
+        i += 2 + tlen;
     }
-    byteSIM[RESPONSE_DATA_FILE_SIZE_1] =
-            byteUSIM[sizeIndex + USIM_DATA_OFFSET_2];
-    byteSIM[RESPONSE_DATA_FILE_SIZE_2] =
-            byteUSIM[sizeIndex + USIM_DATA_OFFSET_3];
+
+    if (desIndex < 0 || sizeIndex < 0) {
+        RLOGW("convertUsimToSim: missing FCP TLV (desIndex=%d sizeIndex=%d len=%d)",
+              desIndex, sizeIndex, len);
+        return false;
+    }
+
+    uint8_t slen = byteUSIM[sizeIndex + 1];
+    if (slen >= 2) {
+        byteSIM[RESPONSE_DATA_FILE_SIZE_1] = byteUSIM[sizeIndex + 2];
+        byteSIM[RESPONSE_DATA_FILE_SIZE_2] = byteUSIM[sizeIndex + 3];
+    } else {
+        byteSIM[RESPONSE_DATA_FILE_SIZE_1] = 0;
+        byteSIM[RESPONSE_DATA_FILE_SIZE_2] = byteUSIM[sizeIndex + 2];
+    }
+
     byteSIM[RESPONSE_DATA_FILE_TYPE] = TYPE_EF;
-    if ((byteUSIM[desIndex + RESPONSE_DATA_FILE_DES_FLAG] & 0x07) ==
-        EF_TYPE_TRANSPARENT) {
+    uint8_t dlen = byteUSIM[desIndex + 1];
+    uint8_t fdb = byteUSIM[desIndex + 2];
+    if ((fdb & 0x07) == EF_TYPE_TRANSPARENT) {
         byteSIM[RESPONSE_DATA_STRUCTURE] = 0;
-    } else if ((byteUSIM[desIndex + RESPONSE_DATA_FILE_DES_FLAG] & 0x07) ==
-                EF_TYPE_LINEAR_FIXED) {
-        if (USIM_FILE_DES_TAG != byteUSIM[RESPONSE_DATA_FILE_DES_FLAG]) {
-            RLOGE("USIM_FILE_DES_TAG != ...");
-            goto error;
-        }
-        if (TYPE_FILE_DES_LEN != byteUSIM[RESPONSE_DATA_FILE_DES_LEN_FLAG]) {
-            goto error;
+    } else if ((fdb & 0x07) == EF_TYPE_LINEAR_FIXED) {
+        if (dlen < TYPE_FILE_DES_LEN) {
+            return false;
         }
         byteSIM[RESPONSE_DATA_STRUCTURE] = 1;
         byteSIM[RESPONSE_DATA_RECORD_LENGTH] =
-                ((byteUSIM[RESPONSE_DATA_FILE_RECORD_LEN_1] & 0xff) << 8) +
-                (byteUSIM[RESPONSE_DATA_FILE_RECORD_LEN_2] & 0xff);
-    } else if ((byteUSIM[desIndex + RESPONSE_DATA_FILE_DES_FLAG] & 0x07) ==
-                EF_TYPE_CYCLIC) {
+                (uint8_t)(((byteUSIM[desIndex + 4] & 0xff) << 8) +
+                          (byteUSIM[desIndex + 5] & 0xff));
+    } else if ((fdb & 0x07) == EF_TYPE_CYCLIC) {
+        if (dlen < TYPE_FILE_DES_LEN) {
+            return false;
+        }
         byteSIM[RESPONSE_DATA_STRUCTURE] = 3;
         byteSIM[RESPONSE_DATA_RECORD_LENGTH] =
-                ((byteUSIM[RESPONSE_DATA_FILE_RECORD_LEN_1] & 0xff) << 8) +
-                (byteUSIM[RESPONSE_DATA_FILE_RECORD_LEN_2] & 0xff);
+                (uint8_t)(((byteUSIM[desIndex + 4] & 0xff) << 8) +
+                          (byteUSIM[desIndex + 5] & 0xff));
     }
 
     convertBytesToHex(byteSIM, RESPONSE_EF_SIZE, hexSIM);
     return true;
-
-error:
-    return false;
 }
 
 static int handleIsimSimIoViaQmi(const RIL_SIM_IO_v6 *p_args, RIL_Token t)
@@ -4017,9 +4033,19 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
     /* FIXME handle pin2 */
 
     if (p_args->data == NULL) {
-        asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d",
-                    p_args->command, p_args->fileid,
-                    p_args->p1, p_args->p2, p_args->p3);
+        if (p_args->command == 192 /* GET RESPONSE */) {
+            /*
+             * Android IccFileHandler passes p3=15 (legacy 2G SIM size), which
+             * causes USIM modems (e.g. SDX55) to truncate the 29+ byte FCP
+             * template before the 0x80 file-size TLV. Omit p1/p2/p3 per 3GPP
+             * TS 27.007 to request the full FCP.
+             */
+            asprintf(&cmd, "AT+CRSM=%d,%d", p_args->command, p_args->fileid);
+        } else {
+            asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d",
+                        p_args->command, p_args->fileid,
+                        p_args->p1, p_args->p2, p_args->p3);
+        }
     } else {
         asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d,%s",
                     p_args->command, p_args->fileid,
@@ -4027,6 +4053,15 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
     }
 
     err = at_send_command_singleline(cmd, "+CRSM:", &p_response);
+
+    if ((err < 0 || p_response->success == 0) &&
+        p_args->data == NULL && p_args->command == 192) {
+        at_response_free(p_response);
+        p_response = NULL;
+        free(cmd);
+        asprintf(&cmd, "AT+CRSM=%d,%d,0,0,0", p_args->command, p_args->fileid);
+        err = at_send_command_singleline(cmd, "+CRSM:", &p_response);
+    }
 
     if (err < 0 || p_response->success == 0) {
         goto error;
@@ -4038,19 +4073,46 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
     if (err < 0) {
         goto error;
     }
-    if (sr.simResponse != NULL &&  // Default to be USIM card
+    if (sr.simResponse != NULL && sr.simResponse[0] != '\0' &&
         p_args->command == 192) {  // Get response
-        uint8_t *bytes = convertHexStringToBytes(sr.simResponse, strlen(sr.simResponse));
+        size_t respHexLen = strlen(sr.simResponse);
+        uint8_t *bytes = convertHexStringToBytes(sr.simResponse, respHexLen);
         if (bytes == NULL) {
             RLOGE("Failed to convert sim response to bytes");
             goto error;
         }
-        if (bytes[0] != 0x62) {
+        size_t respBinLen = respHexLen / 2;
+        if (respBinLen >= 2 && bytes[0] == 0x62 && respBinLen < (size_t)(2 + bytes[1])) {
+            /* Modem truncated FCP; re-request with exact FCP length (2 + FCP len byte). */
+            int fullLen = 2 + bytes[1];
+            free(bytes);
+            at_response_free(p_response);
+            p_response = NULL;
+            free(cmd);
+            memset(&sr, 0, sizeof(sr));
+            asprintf(&cmd, "AT+CRSM=192,%d,0,0,%d", p_args->fileid, fullLen);
+            err = at_send_command_singleline(cmd, "+CRSM:", &p_response);
+            if (err < 0 || p_response->success == 0) {
+                goto error;
+            }
+            line = p_response->p_intermediates->line;
+            err = parseSimResponseLine(line, &sr);
+            if (err < 0 || sr.simResponse == NULL) {
+                goto error;
+            }
+            respHexLen = strlen(sr.simResponse);
+            respBinLen = respHexLen / 2;
+            bytes = convertHexStringToBytes(sr.simResponse, respHexLen);
+            if (bytes == NULL) {
+                goto error;
+            }
+        }
+        if (respBinLen < 2 || bytes[0] != 0x62) {
             RLOGE("Wrong FCP flag, unable to convert to sim ");
             free(bytes);
             goto error;
         }
-        if (convertUsimToSim(bytes, strlen(sr.simResponse) / 2, hexSIM)) {
+        if (convertUsimToSim(bytes, (int)respBinLen, hexSIM)) {
           sr.simResponse = (char *)hexSIM;
         }
         free(bytes);
