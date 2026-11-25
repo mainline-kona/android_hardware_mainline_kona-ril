@@ -1634,14 +1634,17 @@ static void initEmptySignalStrength(RIL_SignalStrength_v12 *ss)
 static uint32_t s_qmiNasNode = 0;
 static uint32_t s_qmiNasPort = 0;
 static int s_qmiNasResolved = 0;
-static uint16_t s_qmiNasTxn = 1;
+static uint32_t s_qmiUimNode = 0;
+static uint32_t s_qmiUimPort = 0;
+static int s_qmiUimResolved = 0;
+static uint16_t s_qmiTxn = 1;
 
-static int qmiLookupNas(uint32_t *out_node, uint32_t *out_port)
+static int qmiLookupService(uint32_t service, uint32_t *out_node, uint32_t *out_port)
 {
     int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     struct sockaddr_qrtr local;
@@ -1659,7 +1662,7 @@ static int qmiLookupNas(uint32_t *out_node, uint32_t *out_port)
     struct qrtr_ctrl_pkt req;
     memset(&req, 0, sizeof(req));
     req.cmd = QRTR_TYPE_NEW_LOOKUP;
-    req.server.service = 3; /* QMI_SERVICE_NAS */
+    req.server.service = service;
     req.server.instance = 0;
 
     if (sendto(fd, &req, sizeof(req), 0, (struct sockaddr *)&ctrl, sizeof(ctrl)) < 0) {
@@ -1675,7 +1678,7 @@ static int qmiLookupNas(uint32_t *out_node, uint32_t *out_port)
         if (resp.cmd == QRTR_TYPE_NEW_SERVER) {
             if (resp.server.service == 0 && resp.server.node == 0 && resp.server.port == 0)
                 break;
-            if (resp.server.service == 3) {
+            if (resp.server.service == service) {
                 *out_node = resp.server.node;
                 *out_port = resp.server.port;
                 found = 1;
@@ -1686,53 +1689,287 @@ static int qmiLookupNas(uint32_t *out_node, uint32_t *out_port)
     return found ? 0 : -1;
 }
 
-static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
+static ssize_t qmiSendRecv(uint32_t node, uint32_t port, uint16_t msg_id,
+                           const uint8_t *tlvs, size_t tlv_len,
+                           uint8_t *resp, size_t resp_cap, int timeout_ms)
+{
+    if (tlv_len > 1000) return -1;
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_qrtr dst = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = node,
+        .sq_port = port,
+    };
+
+    uint16_t txn = s_qmiTxn++;
+    if (s_qmiTxn == 0) s_qmiTxn = 1;
+
+    uint8_t pkt[1024];
+    pkt[0] = 0x00;
+    pkt[1] = (uint8_t)(txn & 0xff);
+    pkt[2] = (uint8_t)((txn >> 8) & 0xff);
+    pkt[3] = (uint8_t)(msg_id & 0xff);
+    pkt[4] = (uint8_t)((msg_id >> 8) & 0xff);
+    pkt[5] = (uint8_t)(tlv_len & 0xff);
+    pkt[6] = (uint8_t)((tlv_len >> 8) & 0xff);
+    if (tlv_len > 0 && tlvs) {
+        memcpy(pkt + 7, tlvs, tlv_len);
+    }
+
+    if (sendto(fd, pkt, 7 + tlv_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    ssize_t n = recv(fd, resp, resp_cap, 0);
+    close(fd);
+    if (n < 7) return -1;
+    uint16_t rmsg = (uint16_t)(resp[3] | (resp[4] << 8));
+    if (rmsg != msg_id) return -1;
+    return n;
+}
+
+static int qmiCheckResultTlv(const uint8_t *buf, size_t len, uint16_t *err_out)
+{
+    size_t pos = 7;
+    while (pos + 3 <= len) {
+        uint8_t t = buf[pos];
+        uint16_t l = (uint16_t)(buf[pos + 1] | (buf[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > len) break;
+        if (t == 0x02 && l >= 4) {
+            uint16_t res = (uint16_t)(buf[pos] | (buf[pos + 1] << 8));
+            uint16_t err = (uint16_t)(buf[pos + 2] | (buf[pos + 3] << 8));
+            if (err_out) *err_out = err;
+            return (res == 0) ? 0 : -1;
+        }
+        pos += l;
+    }
+    return -1;
+}
+
+static int qmiEnsureNas(void)
 {
     if (!s_qmiNasResolved) {
-        if (qmiLookupNas(&s_qmiNasNode, &s_qmiNasPort) < 0) {
+        if (qmiLookupService(3 /* QMI_SERVICE_NAS */, &s_qmiNasNode, &s_qmiNasPort) < 0) {
             return -1;
         }
         s_qmiNasResolved = 1;
         RLOGI("QMI NAS resolved at QRTR node=%u port=%u", s_qmiNasNode, s_qmiNasPort);
     }
+    return 0;
+}
 
-    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
+static int qmiEnsureUim(void)
+{
+    if (!s_qmiUimResolved) {
+        if (qmiLookupService(11 /* QMI_SERVICE_UIM */, &s_qmiUimNode, &s_qmiUimPort) < 0) {
+            return -1;
+        }
+        s_qmiUimResolved = 1;
+        RLOGI("QMI UIM resolved at QRTR node=%u port=%u", s_qmiUimNode, s_qmiUimPort);
+    }
+    return 0;
+}
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+static int qmiNasSetModePreference(int raf_bitmap)
+{
+    if (qmiEnsureNas() < 0) return -1;
 
-    struct sockaddr_qrtr dst = {
-        .sq_family = AF_QIPCRTR,
-        .sq_node = s_qmiNasNode,
-        .sq_port = s_qmiNasPort,
+    uint16_t mode_pref = 0;
+    if (raf_bitmap & CDMA) mode_pref |= (1u << 0);
+    if (raf_bitmap & EVDO) mode_pref |= (1u << 1);
+    if (raf_bitmap & GSM) mode_pref |= (1u << 2);
+    if (raf_bitmap & WCDMA) mode_pref |= (1u << 3);
+    if (raf_bitmap & (LTE | RAF_LTE_CA)) mode_pref |= (1u << 4);
+    if (raf_bitmap & RAF_TD_SCDMA) mode_pref |= (1u << 5);
+    if (raf_bitmap & NR) mode_pref |= (1u << 6);
+
+    if (mode_pref == 0) {
+        RLOGW("qmiNasSetModePreference: empty mode_pref for bitmap 0x%x, ignoring", raf_bitmap);
+        return -1;
+    }
+
+    uint8_t tlvs[] = {
+        0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
+        0x17, 0x01, 0x00, 0x01, /* QMI_NAS_CHANGE_DURATION_PERMANENT */
     };
-
-    uint16_t txn = s_qmiNasTxn++;
-    if (s_qmiNasTxn == 0) s_qmiNasTxn = 1;
-    uint8_t req[7] = {
-        0x00,
-        (uint8_t)(txn & 0xff),
-        (uint8_t)((txn >> 8) & 0xff),
-        0x4f, 0x00, /* QMI_NAS_GET_SIGNAL_INFO */
-        0x00, 0x00,
-    };
-
-    if (sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
-        close(fd);
+    uint8_t resp[256];
+    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033 /* SetSystemSelectionPreference */,
+                            tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
+    if (n < 0) {
         s_qmiNasResolved = 0;
         return -1;
     }
+    uint16_t qerr = 0;
+    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+        RLOGW("QMI NAS SetSystemSelectionPreference(0x%04x) QMI err=0x%04x", mode_pref, qerr);
+        return -1;
+    }
+    RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> mode_pref=0x%04x OK",
+          raf_bitmap, mode_pref);
+    return 0;
+}
+
+static int qmiUimOpenLogicalChannel(const uint8_t *aid, size_t aid_len, int p2,
+                                    uint8_t *out_ch, uint8_t *out_sel, size_t *out_sel_len,
+                                    uint8_t *out_sw1, uint8_t *out_sw2)
+{
+    if (qmiEnsureUim() < 0) return -1;
+
+    uint8_t tlvs[128];
+    size_t off = 0;
+    /* TLV 0x01: Slot = 1 */
+    tlvs[off++] = 0x01; tlvs[off++] = 0x01; tlvs[off++] = 0x00; tlvs[off++] = 0x01;
+    /* TLV 0x10: AID (optional) */
+    if (aid && aid_len > 0 && aid_len <= 64) {
+        tlvs[off++] = 0x10;
+        tlvs[off++] = (uint8_t)(aid_len + 1);
+        tlvs[off++] = 0x00;
+        tlvs[off++] = (uint8_t)aid_len;
+        memcpy(tlvs + off, aid, aid_len);
+        off += aid_len;
+    }
+    /* TLV 0x11: File Control Information (optional, mapped from ISO 7816-4 P2) */
+    if (p2 >= 0) {
+        uint8_t fci = 0; /* FCP */
+        if ((p2 & 0x0c) == 0x00) fci = 2;      /* FCI */
+        else if ((p2 & 0x0c) == 0x04) fci = 0; /* FCP */
+        else if ((p2 & 0x0c) == 0x08) fci = 1; /* FMD */
+        else if ((p2 & 0x0c) == 0x0c) fci = 3; /* NO DATA */
+        tlvs[off++] = 0x11; tlvs[off++] = 0x01; tlvs[off++] = 0x00; tlvs[off++] = fci;
+    }
+
+    uint8_t resp[512];
+    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x0042 /* OpenLogicalChannel */,
+                            tlvs, off, resp, sizeof(resp), 2000);
+    if (n < 0) {
+        s_qmiUimResolved = 0;
+        return -1;
+    }
+    uint16_t qerr = 0;
+    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+        RLOGW("QMI UIM OpenLogicalChannel failed err=0x%04x", qerr);
+        return -1;
+    }
+
+    int got_ch = 0;
+    if (out_sel_len) *out_sel_len = 0;
+    if (out_sw1) *out_sw1 = 0x90;
+    if (out_sw2) *out_sw2 = 0x00;
+
+    size_t pos = 7;
+    while (pos + 3 <= (size_t)n) {
+        uint8_t t = resp[pos];
+        uint16_t l = (uint16_t)(resp[pos + 1] | (resp[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > (size_t)n) break;
+        if (t == 0x10 && l >= 1) {
+            if (out_ch) *out_ch = resp[pos];
+            got_ch = 1;
+        } else if (t == 0x11 && l >= 2) {
+            if (out_sw1) *out_sw1 = resp[pos];
+            if (out_sw2) *out_sw2 = resp[pos + 1];
+        } else if (t == 0x12 && l >= 1 && out_sel && out_sel_len) {
+            size_t slen = resp[pos];
+            if (slen > (size_t)(l - 1)) slen = (size_t)(l - 1);
+            if (slen > 255) slen = 255;
+            memcpy(out_sel, resp + pos + 1, slen);
+            *out_sel_len = slen;
+        }
+        pos += l;
+    }
+    return got_ch ? 0 : -1;
+}
+
+static int qmiUimCloseLogicalChannel(uint8_t ch)
+{
+    if (qmiEnsureUim() < 0) return -1;
+    uint8_t tlvs[] = {
+        0x01, 0x01, 0x00, 0x01, /* Slot = 1 */
+        0x11, 0x01, 0x00, ch,   /* Channel ID to close */
+    };
+    uint8_t resp[256];
+    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x003F /* LogicalChannel */,
+                            tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
+    if (n < 0) {
+        s_qmiUimResolved = 0;
+        return -1;
+    }
+    uint16_t qerr = 0;
+    return qmiCheckResultTlv(resp, (size_t)n, &qerr);
+}
+
+static int qmiUimSendApdu(uint8_t ch, const uint8_t *apdu, size_t apdu_len,
+                          uint8_t *out_resp, size_t resp_cap, size_t *out_resp_len)
+{
+    if (qmiEnsureUim() < 0 || !apdu || apdu_len == 0 || apdu_len > 512) return -1;
+
+    uint8_t tlvs[600];
+    size_t off = 0;
+    /* TLV 0x01: Slot = 1 */
+    tlvs[off++] = 0x01; tlvs[off++] = 0x01; tlvs[off++] = 0x00; tlvs[off++] = 0x01;
+    /* TLV 0x02: APDU (uint16 len + bytes) */
+    uint16_t tlv2_len = (uint16_t)(apdu_len + 2);
+    tlvs[off++] = 0x02;
+    tlvs[off++] = (uint8_t)(tlv2_len & 0xff);
+    tlvs[off++] = (uint8_t)((tlv2_len >> 8) & 0xff);
+    tlvs[off++] = (uint8_t)(apdu_len & 0xff);
+    tlvs[off++] = (uint8_t)((apdu_len >> 8) & 0xff);
+    memcpy(tlvs + off, apdu, apdu_len);
+    off += apdu_len;
+    /* TLV 0x10: Channel ID */
+    tlvs[off++] = 0x10; tlvs[off++] = 0x01; tlvs[off++] = 0x00; tlvs[off++] = ch;
+
+    uint8_t resp[1024];
+    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x003B /* SendAPDU */,
+                            tlvs, off, resp, sizeof(resp), 3000);
+    if (n < 0) {
+        s_qmiUimResolved = 0;
+        return -1;
+    }
+    uint16_t qerr = 0;
+    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+        RLOGW("QMI UIM SendAPDU(ch=%u) failed err=0x%04x", ch, qerr);
+        return -1;
+    }
+
+    size_t pos = 7;
+    while (pos + 3 <= (size_t)n) {
+        uint8_t t = resp[pos];
+        uint16_t l = (uint16_t)(resp[pos + 1] | (resp[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > (size_t)n) break;
+        if (t == 0x10 && l >= 2) {
+            uint16_t rlen = (uint16_t)(resp[pos] | (resp[pos + 1] << 8));
+            if (rlen > l - 2) rlen = (uint16_t)(l - 2);
+            if (rlen > resp_cap) rlen = (uint16_t)resp_cap;
+            if (out_resp && rlen > 0) memcpy(out_resp, resp + pos + 2, rlen);
+            if (out_resp_len) *out_resp_len = rlen;
+            return 0;
+        }
+        pos += l;
+    }
+    return -1;
+}
+
+static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
+{
+    if (qmiEnsureNas() < 0) return -1;
 
     uint8_t buf[512];
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    close(fd);
+    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x004f /* GetSignalInfo */,
+                            NULL, 0, buf, sizeof(buf), 250);
     if (n < 7) {
         s_qmiNasResolved = 0;
-        return -1;
-    }
-    uint16_t msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
-    if (msg_id != 0x004f) {
         return -1;
     }
 
@@ -1967,6 +2204,9 @@ static void requestSetPreferredNetworkType(int request, void *data,
 
     if (request != RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE) {
         s_allowedNetworkTypes = value;
+        if (qmiNasSetModePreference(value) == 0) {
+            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+        }
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         return;
     }
@@ -2977,88 +3217,48 @@ static void requestSimOpenChannel(void *data, size_t datalen, RIL_Token t)
 {
     RIL_UNUSED_PARM(datalen);
 
-    ATResponse *p_response = NULL;
-    int response[260] = {0};
-    int responseLen = 1;
-    int32_t session_id;
-    int err;
-    char cmd[64] = {0};
-    char complex;
-    char *line = NULL;
-    int skip = 0;
-    char *statusWord = NULL;
-    int err_no = RIL_E_GENERIC_FAILURE;
-
+    int response[264] = {0};
+    int responseLen = 0;
     RIL_OpenChannelParams *params = (RIL_OpenChannelParams *)data;
 
-    // Max length is 16 bytes according to 3GPP spec 27.007 section 8.45
-    if (params->aidPtr == NULL) {
-          err = at_send_command_singleline("AT+CSIM=10,\"0070000001\"", "+CSIM:", &p_response);
-    } else {
-        snprintf(cmd, sizeof(cmd), "AT+CCHO=%s", params->aidPtr);
-        err = at_send_command_numeric(cmd, &p_response);
-    }
-
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        ALOGE("Error %d opening logical channel: %d",
-              err, p_response ? p_response->success : 0);
-        goto error;
-    }
-
-    // Ensure integer only by scanning for an extra char but expect one result
-    line = p_response->p_intermediates->line;
-    if (params->aidPtr == NULL) {
-
-        err = at_tok_start(&line);
-        if (err < 0) goto error;
-
-        err = at_tok_nextint(&line, &skip);
-        if (err < 0) goto error;
-
-        err = at_tok_nextstr(&line, &statusWord);
-        if (err < 0) goto error;
-
-        if (params->p2 < 0) {
-            int length = strlen(statusWord) / 2;
-            for (responseLen = 0; responseLen < length; responseLen++) {
-                sscanf(statusWord, "%02x", &(response[responseLen]));
-                statusWord += 2;
-            }
-            err_no = RIL_E_SUCCESS;
-        } else {
-            response[0] = 1;
-            err_no = sendCmdAgainForOpenChannelWithP2(statusWord,
-                                        params->p2, response, &responseLen);
-            if (err_no != RIL_E_SUCCESS) {
-                goto error;
-            }
-        }
-        RIL_onRequestComplete(t, err_no, response, responseLen * sizeof(int));
-        at_response_free(p_response);
+    if (!params) {
+        RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
         return;
-    } else {
-        if (sscanf(line, "%" SCNd32 "%c", &session_id, &complex) != 1) {
-           ALOGE("Invalid AT response, expected integer, was '%s'", line);
-           goto error;
-        }
     }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, &session_id, sizeof(session_id));
-    at_response_free(p_response);
-    return;
+    uint8_t *aid_bytes = NULL;
+    size_t aid_len = 0;
+    if (params->aidPtr != NULL && params->aidPtr[0] != '\0') {
+        size_t hex_len = strlen(params->aidPtr);
+        aid_len = hex_len / 2;
+        aid_bytes = convertHexStringToBytes((void *)params->aidPtr, hex_len);
+    }
 
-error:
-    RIL_onRequestComplete(t, err_no, NULL, 0);
-    at_response_free(p_response);
-    return;
+    uint8_t ch = 0, sw1 = 0x90, sw2 = 0x00;
+    uint8_t sel_resp[256];
+    size_t sel_len = 0;
+    int qret = qmiUimOpenLogicalChannel(aid_bytes, aid_len, params->p2,
+                                        &ch, sel_resp, &sel_len, &sw1, &sw2);
+    free(aid_bytes);
+    if (qret == 0) {
+        response[responseLen++] = ch;
+        for (size_t i = 0; i < sel_len && responseLen < 260; i++) {
+            response[responseLen++] = sel_resp[i];
+        }
+        response[responseLen++] = sw1;
+        response[responseLen++] = sw2;
+        RLOGD("requestSimOpenChannel(QMI UIM): aid=%s -> ch=%u sel_len=%zu sw=%02x%02x",
+              params->aidPtr ? params->aidPtr : "(null)", ch, sel_len, sw1, sw2);
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, response, responseLen * sizeof(int));
+        return;
+    }
+
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
 static void requestSimCloseChannel(void *data, size_t datalen, RIL_Token t)
 {
-    ATResponse *p_response = NULL;
     int32_t session_id;
-    int err;
-    char cmd[32];
 
     if (data == NULL || datalen != sizeof(session_id)) {
         ALOGE("Invalid data passed to requestSimCloseChannel");
@@ -3066,37 +3266,22 @@ static void requestSimCloseChannel(void *data, size_t datalen, RIL_Token t)
         return;
     }
     session_id = ((int32_t *)data)[0];
-    if (session_id == 0) {
+    if (session_id <= 0 || session_id > 255) {
         RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
         return;
     }
 
-    snprintf(cmd, sizeof(cmd), "AT+CCHC=%" PRId32, session_id);
-    err = at_send_command_singleline(cmd, "+CCHC", &p_response);
-
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        ALOGE("Error %d closing logical channel %d: %d",
-              err, session_id, p_response ? p_response->success : 0);
-        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-        at_response_free(p_response);
+    if (qmiUimCloseLogicalChannel((uint8_t)session_id) == 0) {
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         return;
     }
-
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
-
-    at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
 static void requestSimTransmitApduChannel(void *data,
                                           size_t datalen,
                                           RIL_Token t)
 {
-    ATResponse *p_response = NULL;
-    int err;
-    int len = 0;
-    char *cmd;
-    char *line = NULL;
-    size_t cmd_size;
     RIL_SIM_IO_Response sr = {0};
     RIL_SIM_APDU *apdu = (RIL_SIM_APDU *)data;
 
@@ -3105,199 +3290,137 @@ static void requestSimTransmitApduChannel(void *data,
         return;
     }
 
-    cmd_size = 10 + (apdu->data ? strlen(apdu->data) : 0);
-    asprintf(&cmd, "AT+CGLA=%d,%zu,%02x%02x%02x%02x%02x%s",
-             apdu->sessionid, cmd_size, apdu->cla, apdu->instruction,
-             apdu->p1, apdu->p2, apdu->p3, apdu->data ? apdu->data : "");
-
-    err = at_send_command_singleline(cmd, "+CGLA:", &p_response);
-    free(cmd);
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        ALOGE("Error %d transmitting APDU: %d",
-              err, p_response ? p_response->success : 0);
-        goto error;
+    uint8_t raw[300];
+    size_t raw_len = 0;
+    raw[raw_len++] = (uint8_t)(apdu->cla & 0xff);
+    raw[raw_len++] = (uint8_t)(apdu->instruction & 0xff);
+    raw[raw_len++] = (uint8_t)(apdu->p1 & 0xff);
+    raw[raw_len++] = (uint8_t)(apdu->p2 & 0xff);
+    if (apdu->p3 >= 0) {
+        raw[raw_len++] = (uint8_t)(apdu->p3 & 0xff);
+    }
+    if (apdu->data != NULL && apdu->data[0] != '\0') {
+        size_t hex_len = strlen(apdu->data);
+        size_t dlen = hex_len / 2;
+        uint8_t *dbytes = convertHexStringToBytes((void *)apdu->data, hex_len);
+        if (!dbytes || raw_len + dlen > sizeof(raw)) {
+            free(dbytes);
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            return;
+        }
+        memcpy(raw + raw_len, dbytes, dlen);
+        raw_len += dlen;
+        free(dbytes);
     }
 
-    line = p_response->p_intermediates->line;
-    err = at_tok_start(&line);
-    if (err < 0) goto error;
+    uint8_t resp[512];
+    size_t resp_len = 0;
+    if (qmiUimSendApdu((uint8_t)apdu->sessionid, raw, raw_len,
+                       resp, sizeof(resp), &resp_len) < 0 || resp_len < 2) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
 
-    err = at_tok_nextint(&line, &len);
-    if (err < 0) goto error;
-
-    err = at_tok_nextstr(&line, &(sr.simResponse));
-    if (err < 0) goto error;
-
-    len = strlen(sr.simResponse);
-    if (len < 4) goto error;
-
-    sscanf(&(sr.simResponse[len - 4]), "%02x%02x", &(sr.sw1), &(sr.sw2));
-    sr.simResponse[len - 4] = '\0';
+    sr.sw1 = resp[resp_len - 2];
+    sr.sw2 = resp[resp_len - 1];
+    size_t payload_len = resp_len - 2;
+    char *hexResp = (char *)calloc(payload_len * 2 + 1, 1);
+    if (!hexResp) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
+    if (payload_len > 0) {
+        convertBytesToHexString((char *)resp, (int)payload_len, (unsigned char *)hexResp);
+    }
+    sr.simResponse = hexResp;
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
-    at_response_free(p_response);
-    return;
-
-error:
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-    at_response_free(p_response);
+    free(hexResp);
 }
 
 static void requestSimAuthentication(int authContext, char* authData, RIL_Token t) {
-    int err = -1, ret = 0;
-    int status = 0;
-    int binSimResponseLen = 0;
-    char *cmd = NULL;
-    char *line = NULL;
-    // Input data
-    int randLen = 0, autnLen = 0;
-    char *rand = NULL, *autn = NULL;
-    // EAP-SIM response data
-    int kcLen = 0, sresLen = 0;
-    char *kc = NULL, *sres = NULL;
-    // EAP-AKA response data
-    int ckLen = 0, ikLen = 0, resAutsLen = 0;
-    char *ck = NULL, *ik = NULL, *resAuts = NULL;
-    unsigned char *binSimResponse = NULL;
     unsigned char *binAuthData = NULL;
-    unsigned char *hexAuthData = NULL;
-    ATResponse *p_response = NULL;
     RIL_SIM_IO_Response response;
+    uint8_t ch = 0;
+    int ch_opened = 0;
 
     memset(&response, 0, sizeof(response));
     response.sw1 = 0x90;
     response.sw2 = 0;
 
-    int binAuthLen = 0;
+    if (!authData) goto error;
+
     binAuthData = (unsigned char *)malloc(strlen(authData) + 1);
-    if (binAuthData == NULL) {
+    if (!binAuthData) goto error;
+    int binAuthLen = base64_decode(authData, binAuthData);
+    if (binAuthLen <= 0 || binAuthLen > 240) {
+        RLOGE("requestSimAuthentication: base64_decode failed len=%d", binAuthLen);
         goto error;
     }
-    binAuthLen = base64_decode(authData, binAuthData);
-    if (binAuthLen <= 0) {
-        RLOGE("base64_decode failed %s %d", __func__, __LINE__);
-        goto error;
-    }
-    hexAuthData = (unsigned char *)malloc(binAuthLen * 2 + 1);
-    if (hexAuthData == NULL) {
-        goto error;
-    }
-    memset(hexAuthData, 0, binAuthLen * 2 + 1);
-    convertBytesToHexString((char *)binAuthData, binAuthLen, hexAuthData);
 
-    /* Open logical channel to ISIM (A0000000871004), falling back to USIM (A0000000871002) */
-    int channel = -1;
-    err = at_send_command_singleline("AT+CCHO=\"A0000000871004\"", "+CCHO:", &p_response);
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        at_response_free(p_response);
-        p_response = NULL;
-        err = at_send_command_singleline("AT+CCHO=\"A0000000871002\"", "+CCHO:", &p_response);
-    }
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        RLOGE("requestSimAuthentication: AT+CCHO failed");
+    /* Open logical channel via QMI UIM to ISIM (A0000000871004), falling back to USIM */
+    static const uint8_t kIsimAid[7] = { 0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04 };
+    static const uint8_t kUsimAid[7] = { 0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02 };
+    if (qmiUimOpenLogicalChannel(kIsimAid, sizeof(kIsimAid), -1, &ch, NULL, NULL, NULL, NULL) == 0 ||
+        qmiUimOpenLogicalChannel(kUsimAid, sizeof(kUsimAid), -1, &ch, NULL, NULL, NULL, NULL) == 0) {
+        ch_opened = 1;
+    } else {
+        RLOGE("requestSimAuthentication: QMI UIM OpenLogicalChannel failed");
         goto error;
     }
-    line = p_response->p_intermediates->line;
-    if (at_tok_start(&line) < 0 || at_tok_nextint(&line, &channel) < 0 || channel < 0) {
-        goto error;
-    }
-    at_response_free(p_response);
-    p_response = NULL;
 
-    int cla = (channel < 4) ? channel : (0x40 | (channel - 4));
-    int p2 = (authContext == AUTH_CONTEXT_EAP_AKA) ? 0x81 : 0x80;
-    int apduHexLen = 10 + binAuthLen * 2;
-    ret = asprintf(&cmd, "AT+CGLA=%d,%d,\"%02X8800%02X%02X%s\"",
-                   channel, apduHexLen, cla, p2, binAuthLen, (char *)hexAuthData);
-    if (ret < 0) {
-        RLOGE("Failed to asprintf AT+CGLA");
-        goto close_channel;
-    }
-    err = at_send_command_singleline(cmd, "+CGLA:", &p_response);
-    free(cmd);
-    cmd = NULL;
+    uint8_t cla = (ch < 4) ? ch : (uint8_t)(0x40 | (ch - 4));
+    uint8_t p2 = (authContext == AUTH_CONTEXT_EAP_AKA) ? 0x81 : 0x80;
+    uint8_t apdu[260];
+    apdu[0] = cla;
+    apdu[1] = 0x88; /* AUTHENTICATE */
+    apdu[2] = 0x00;
+    apdu[3] = p2;
+    apdu[4] = (uint8_t)binAuthLen;
+    memcpy(apdu + 5, binAuthData, (size_t)binAuthLen);
 
-    if (err < 0 || p_response == NULL || p_response->success == 0) {
-        RLOGE("requestSimAuthentication: AT+CGLA failed");
+    uint8_t resp[512];
+    size_t resp_len = 0;
+    if (qmiUimSendApdu(ch, apdu, (size_t)(5 + binAuthLen), resp, sizeof(resp), &resp_len) < 0 ||
+        resp_len < 2) {
+        RLOGE("requestSimAuthentication: QMI UIM SendAPDU(AUTHENTICATE) failed");
         goto close_channel;
     }
-    line = p_response->p_intermediates->line;
-    if (at_tok_start(&line) < 0) goto close_channel;
-    int respHexLen = 0;
-    char *respHex = NULL;
-    if (at_tok_nextint(&line, &respHexLen) < 0 || at_tok_nextstr(&line, &respHex) < 0) {
-        goto close_channel;
+
+    /* Handle 61 xx (response data available -> GET RESPONSE) */
+    if (resp[resp_len - 2] == 0x61) {
+        uint8_t get_resp[5] = { cla, 0xC0, 0x00, 0x00, resp[resp_len - 1] };
+        if (qmiUimSendApdu(ch, get_resp, sizeof(get_resp), resp, sizeof(resp), &resp_len) < 0 ||
+            resp_len < 2) {
+            RLOGE("requestSimAuthentication: QMI UIM GET RESPONSE failed");
+            goto close_channel;
+        }
     }
-    int actualHexLen = (int)strlen(respHex);
-    if (actualHexLen < 4) {
-        goto close_channel;
-    }
-    unsigned int sw1 = 0, sw2 = 0;
-    if (sscanf(respHex + actualHexLen - 4, "%02x%02x", &sw1, &sw2) == 2) {
-        response.sw1 = (int)sw1;
-        response.sw2 = (int)sw2;
-    }
-    int payloadHexLen = actualHexLen - 4;
-    binSimResponseLen = payloadHexLen / 2;
-    if (binSimResponseLen > 0) {
-        binSimResponse = convertHexStringToBytes(respHex, payloadHexLen);
-        if (binSimResponse == NULL) goto close_channel;
-        response.simResponse = (char *)malloc(2 * binSimResponseLen + 4);
-        if (response.simResponse == NULL) goto close_channel;
-        base64_encode(binSimResponse, response.simResponse, binSimResponseLen);
+
+    response.sw1 = resp[resp_len - 2];
+    response.sw2 = resp[resp_len - 1];
+    size_t payload_len = resp_len - 2;
+    if (payload_len > 0) {
+        response.simResponse = (char *)calloc(2 * payload_len + 8, 1);
+        if (!response.simResponse) goto close_channel;
+        base64_encode(resp, response.simResponse, (int)payload_len);
     } else {
         response.simResponse = strdup("");
     }
 
+    RLOGI("requestSimAuthentication(QMI UIM): ctx=%d sw=%02x%02x payload_len=%zu",
+          authContext, response.sw1, response.sw2, payload_len);
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
     free(response.simResponse);
-    response.simResponse = NULL;
-    at_response_free(p_response);
-    p_response = NULL;
-    if (channel >= 0 && asprintf(&cmd, "AT+CCHC=%d", channel) >= 0) {
-        at_send_command(cmd, NULL);
-        free(cmd);
-    }
-    free(binSimResponse);
+    if (ch_opened) qmiUimCloseLogicalChannel(ch);
     free(binAuthData);
-    free(hexAuthData);
     return;
 
 close_channel:
-    if (channel >= 0 && asprintf(&cmd, "AT+CCHC=%d", channel) >= 0) {
-        at_send_command(cmd, NULL);
-        free(cmd);
-    }
-    goto error;
-
-    response.simResponse = (char*)malloc(2 * binSimResponseLen + sizeof(char));
-    if (response.simResponse == NULL) goto error;
-    if (NULL == base64_encode(binSimResponse, response.simResponse, binSimResponseLen - 1)) {
-        RLOGE("Failed to call base64_encode %s %d", __func__, __LINE__);
-        goto error;
-    }
-
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
-    at_response_free(p_response);
-
-    free(binAuthData);
-    free(hexAuthData);
-    free(rand);
-    free(autn);
-    free(response.simResponse);
-    free(binSimResponse);
-    return;
-
+    if (ch_opened) qmiUimCloseLogicalChannel(ch);
 error:
     free(binAuthData);
-    free(hexAuthData);
-    free(rand);
-    free(autn);
-    free(response.simResponse);
-    free(binSimResponse);
-
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-    at_response_free(p_response);
 }
 
 static void requestTransmitApduBasic( void *data, size_t datalen,
@@ -3705,6 +3828,89 @@ error:
     return false;
 }
 
+static int handleIsimSimIoViaQmi(const RIL_SIM_IO_v6 *p_args, RIL_Token t)
+{
+    static const uint8_t kIsimAid[7] = { 0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04 };
+    uint8_t ch = 0;
+    if (qmiUimOpenLogicalChannel(kIsimAid, sizeof(kIsimAid), -1, &ch, NULL, NULL, NULL, NULL) < 0) {
+        return -1;
+    }
+
+    uint8_t cla = (ch < 4) ? ch : (uint8_t)(0x40 | (ch - 4));
+    uint8_t sel[7] = {
+        cla, 0xA4, 0x00, 0x04, 0x02,
+        (uint8_t)((p_args->fileid >> 8) & 0xff),
+        (uint8_t)(p_args->fileid & 0xff),
+    };
+    uint8_t resp[512];
+    size_t resp_len = 0;
+    int rc = -1;
+
+    if (qmiUimSendApdu(ch, sel, sizeof(sel), resp, sizeof(resp), &resp_len) < 0 || resp_len < 2) {
+        goto done;
+    }
+
+    RIL_SIM_IO_Response sr;
+    memset(&sr, 0, sizeof(sr));
+    uint8_t hexSIM[RESPONSE_EF_SIZE * 2 + 1] = {0};
+    char *hexResp = NULL;
+
+    if (p_args->command == 192 /* GET RESPONSE */) {
+        if (resp[resp_len - 2] == 0x61) {
+            uint8_t get_resp[5] = { cla, 0xC0, 0x00, 0x00, resp[resp_len - 1] };
+            if (qmiUimSendApdu(ch, get_resp, sizeof(get_resp),
+                               resp, sizeof(resp), &resp_len) < 0 || resp_len < 2) {
+                goto done;
+            }
+        }
+        sr.sw1 = resp[resp_len - 2];
+        sr.sw2 = resp[resp_len - 1];
+        size_t plen = resp_len - 2;
+        if (plen > 0 && resp[0] == 0x62 && convertUsimToSim(resp, (int)plen, hexSIM)) {
+            sr.simResponse = (char *)hexSIM;
+        } else if (plen > 0) {
+            hexResp = (char *)calloc(plen * 2 + 1, 1);
+            if (!hexResp) goto done;
+            convertBytesToHexString((char *)resp, (int)plen, (unsigned char *)hexResp);
+            sr.simResponse = hexResp;
+        }
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
+        free(hexResp);
+        rc = 0;
+        goto done;
+    } else if (p_args->command == 176 /* READ BINARY */ ||
+               p_args->command == 178 /* READ RECORD */) {
+        uint8_t cmd_apdu[5] = {
+            cla,
+            (uint8_t)(p_args->command & 0xff),
+            (uint8_t)(p_args->p1 & 0xff),
+            (uint8_t)(p_args->p2 & 0xff),
+            (uint8_t)(p_args->p3 & 0xff),
+        };
+        if (qmiUimSendApdu(ch, cmd_apdu, sizeof(cmd_apdu),
+                           resp, sizeof(resp), &resp_len) < 0 || resp_len < 2) {
+            goto done;
+        }
+        sr.sw1 = resp[resp_len - 2];
+        sr.sw2 = resp[resp_len - 1];
+        size_t plen = resp_len - 2;
+        hexResp = (char *)calloc(plen * 2 + 1, 1);
+        if (!hexResp) goto done;
+        if (plen > 0) {
+            convertBytesToHexString((char *)resp, (int)plen, (unsigned char *)hexResp);
+        }
+        sr.simResponse = hexResp;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
+        free(hexResp);
+        rc = 0;
+        goto done;
+    }
+
+done:
+    qmiUimCloseLogicalChannel(ch);
+    return rc;
+}
+
 static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
 {
     ATResponse *p_response = NULL;
@@ -3720,6 +3926,15 @@ static void  requestSIM_IO(void *data, size_t datalen __unused, RIL_Token t)
     memset(&sr, 0, sizeof(sr));
 
     p_args = (RIL_SIM_IO_v6 *)data;
+
+    /* ISIM EFs cannot be read via default-app AT+CRSM; route through QMI UIM ISIM channel */
+    int is_isim = (p_args->aidPtr != NULL && strncasecmp(p_args->aidPtr, "A0000000871004", 14) == 0) ||
+                  (p_args->fileid == 0x6F02 || p_args->fileid == 0x6F03 ||
+                   p_args->fileid == 0x6F04 || p_args->fileid == 0x6F07 ||
+                   p_args->fileid == 0x6F09);
+    if (is_isim && handleIsimSimIoViaQmi(p_args, t) == 0) {
+        return;
+    }
 
     /* FIXME handle pin2 */
 
@@ -6166,10 +6381,10 @@ static int getCardStatus(RIL_CardStatus_v1_5 **pp_card_status) {
           NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
         // ISIM_NOT_READY = 13
         { RIL_APPTYPE_ISIM, RIL_APPSTATE_DETECTED, RIL_PERSOSUBSTATE_UNKNOWN,
-          NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
+          "A0000000871004", "ISIM", 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
         // ISIM_READY = 14
         { RIL_APPTYPE_ISIM, RIL_APPSTATE_READY, RIL_PERSOSUBSTATE_READY,
-          NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
+          "A0000000871004", "ISIM", 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
         // ISIM_PIN = 15
         { RIL_APPTYPE_ISIM, RIL_APPSTATE_PIN, RIL_PERSOSUBSTATE_UNKNOWN,
           NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN },
