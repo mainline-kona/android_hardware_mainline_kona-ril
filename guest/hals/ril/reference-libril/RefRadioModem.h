@@ -26,7 +26,5 @@ namespace cf::ril {
 class RefRadioModem : public android::hardware::radio::compat::RadioModem {
     public:
         using android::hardware::radio::compat::RadioModem::RadioModem;
-
-         ::ndk::ScopedAStatus getImei(int32_t serial) override;
     };
 }

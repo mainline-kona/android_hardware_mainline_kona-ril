@@ -15,30 +15,8 @@
  */
 
 #include "RefRadioModem.h"
-#include "ril_service.h"
-
-using ::android::hardware::hidl_string;
 
 namespace cf::ril {
-
-    using ::ndk::ScopedAStatus;
-    using namespace ::aidl::android::hardware::radio;
-    constexpr auto ok = &ScopedAStatus::ok;
-
-    static RadioResponseInfo responseInfo(int32_t serial, RadioError error = RadioError::NONE) {
-        return {
-                .type = RadioResponseType::SOLICITED,
-                .serial = serial,
-                .error = error,
-        };
-    }
-
-    ScopedAStatus RefRadioModem::getImei(int32_t serial) {
-        ::aidl::android::hardware::radio::modem::ImeiInfo imeiInfo = {};
-        imeiInfo.type = (::aidl::android::hardware::radio::modem::ImeiInfo::ImeiType) 1;
-        imeiInfo.imei = "867400022047199";
-        imeiInfo.svn = "01";
-        respond()->getImeiResponse(responseInfo(serial), imeiInfo);
-        return ok();
-    }
+// Inherits android::hardware::radio::compat::RadioModem::getImei(), which
+// dispatches to RIL_REQUEST_DEVICE_IDENTITY (real QMI DMS IMEI + IMEI SV).
 }

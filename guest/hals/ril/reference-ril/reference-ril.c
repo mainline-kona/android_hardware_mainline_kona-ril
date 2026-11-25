@@ -1828,8 +1828,25 @@ static int qmiDmsGetBasebandVersion(char *out, size_t out_cap)
     ssize_t n = qmiSendRecv(s_qmiDmsNode, s_qmiDmsPort, 0x0051 /* QMI_DMS_GET_SW_VERSION */,
                             NULL, 0, resp, sizeof(resp), 2000);
     if (n > 7 && qmiCheckResultTlv(resp, (size_t)n, NULL) == 0) {
-        /* Prefer TLV 0x11 (full MPSS firmware version string, e.g. MPSS.HI.2.5-...) */
         if (qmiExtractStringTlv(resp, (size_t)n, 0x11, out, out_cap) == 0) {
+            /*
+             * Android GsmCdmaPhone truncates baseband versions > 45 chars
+             * (PROP_VALUE_MAX / 2) from the front, clipping "MPSS.HI.2".
+             * Trim any trailing ".<numeric-build>" suffix after "PACK-<n>"
+             * so the full MPSS version fits cleanly within 45 chars.
+             */
+            if (strlen(out) > 45) {
+                char *pack = strstr(out, "PACK-");
+                if (pack) {
+                    char *dot = strchr(pack, '.');
+                    if (dot && (size_t)(dot - out) <= 45) {
+                        *dot = '\0';
+                    }
+                }
+                if (strlen(out) > 45) {
+                    out[45] = '\0';
+                }
+            }
             return 0;
         }
         if (qmiExtractStringTlv(resp, (size_t)n, 0x01, out, out_cap) == 0) {
