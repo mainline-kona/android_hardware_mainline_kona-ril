@@ -36,6 +36,8 @@ cc_library {
     vendor: true,
     cflags: [
         "-DRIL_SHLIB",
+        "-DSIM_COUNT=2",
+        "-DANDROID_MULTI_SIM",
         "-D_GNU_SOURCE",
         "-Wall",
         "-Werror",

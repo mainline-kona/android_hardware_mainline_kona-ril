@@ -21,6 +21,8 @@ cc_library {
     defaults: ["android.hardware.radio-library.aidl_deps"],
     vendor: true,
     cflags: [
+        "-DSIM_COUNT=2",
+        "-DANDROID_MULTI_SIM",
         "-Wextra",
         "-Wno-unused-parameter",
     ],

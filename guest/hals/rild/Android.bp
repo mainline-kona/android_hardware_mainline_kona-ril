@@ -21,6 +21,8 @@ cc_binary {
     vendor: true,
     cflags: [
         "-DRIL_SHLIB",
+        "-DSIM_COUNT=2",
+        "-DANDROID_MULTI_SIM",
         "-Wall",
         "-Werror",
         "-Wextra",

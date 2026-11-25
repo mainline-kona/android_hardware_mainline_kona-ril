@@ -117,8 +117,8 @@ int64_t nitzTimeReceived[1];
 // counter used for synchronization. It is incremented every time response callbacks are updated.
 std::atomic_int32_t mCounterRadio[1];
 std::atomic_int32_t mCounterOemHook[1];
-hidl_vec<uint8_t> osAppIdVec;
 #endif
+hidl_vec<uint8_t> osAppIdVec;
 
 static pthread_rwlock_t radioServiceRwlock = PTHREAD_RWLOCK_INITIALIZER;
 
@@ -13644,13 +13644,13 @@ void radio_1_6::registerService(RIL_RadioFunctions *callbacks, CommandInfo *comm
         radioService[i]->mCallbackManager = callbackMgr;
         publishRadioHal<compat::RadioData>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<compat::RadioMessaging>(context, radioHidl, callbackMgr, slot);
-        publishRadioHal<compat::RadioModem>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<cf::ril::RefRadioNetwork>(context, radioHidl, callbackMgr, slot);
-        publishRadioHal<compat::RadioSim>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<compat::RadioVoice>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<cf::ril::RefRadioIms>(context, radioHidl, callbackMgr, slot);
-        publishRadioHal<cf::ril::RefImsMedia>(context, radioHidl, callbackMgr,
-                                              std::string("default"));
+        if (i == 0) {
+            publishRadioHal<cf::ril::RefImsMedia>(context, radioHidl, callbackMgr,
+                                                  std::string("default"));
+        }
         publishRadioHal<cf::ril::RefRadioModem>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<cf::ril::RefRadioSim>(context, radioHidl, callbackMgr, slot);
 
@@ -13673,11 +13673,11 @@ pthread_rwlock_t * radio_1_6::getRadioServiceRwlock(int slotId) {
     pthread_rwlock_t *radioServiceRwlockPtr = &radioServiceRwlock;
 
     #if (SIM_COUNT >= 2)
-    if (slotId == 2) radioServiceRwlockPtr = &radioServiceRwlock2;
+    if (slotId == 1) radioServiceRwlockPtr = &radioServiceRwlock2;
     #if (SIM_COUNT >= 3)
-    if (slotId == 3) radioServiceRwlockPtr = &radioServiceRwlock3;
+    if (slotId == 2) radioServiceRwlockPtr = &radioServiceRwlock3;
     #if (SIM_COUNT >= 4)
-    if (slotId == 4) radioServiceRwlockPtr = &radioServiceRwlock4;
+    if (slotId == 3) radioServiceRwlockPtr = &radioServiceRwlock4;
     #endif
     #endif
     #endif

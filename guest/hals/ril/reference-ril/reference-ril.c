@@ -296,8 +296,14 @@ typedef enum {
     ISIM_NETWORK_PERSONALIZATION = 17,
 } SIM_Status;
 
+#if defined(ANDROID_MULTI_SIM)
+static void onRequest (int request, void *data, size_t datalen, RIL_Token t,
+                       RIL_SOCKET_ID socket_id);
+static RIL_RadioState currentState(RIL_SOCKET_ID socket_id);
+#else
 static void onRequest (int request, void *data, size_t datalen, RIL_Token t);
 static RIL_RadioState currentState();
+#endif
 static int onSupports (int requestCode);
 static void onCancel (RIL_Token t);
 static const char *getVersion();
@@ -326,11 +332,20 @@ static const RIL_RadioFunctions s_callbacks = {
 static const struct RIL_Env *s_rilenv;
 
 #define RIL_onRequestComplete(t, e, response, responselen) s_rilenv->OnRequestComplete(t,e, response, responselen)
+#if defined(ANDROID_MULTI_SIM)
+#define RIL_onUnsolicitedResponse(a,b,c) s_rilenv->OnUnsolicitedResponse(a,b,c,RIL_SOCKET_1)
+#define RIL_onUnsolicitedResponseForSlot(a,b,c,s) s_rilenv->OnUnsolicitedResponse(a,b,c,s)
+#else
 #define RIL_onUnsolicitedResponse(a,b,c) s_rilenv->OnUnsolicitedResponse(a,b,c)
+#define RIL_onUnsolicitedResponseForSlot(a,b,c,s) s_rilenv->OnUnsolicitedResponse(a,b,c)
+#endif
 #define RIL_requestTimedCallback(a,b,c) s_rilenv->RequestTimedCallback(a,b,c)
 #endif
 
 static RIL_RadioState sState = RADIO_STATE_UNAVAILABLE;
+static RIL_RadioState sStateSlot2 = RADIO_STATE_UNAVAILABLE;
+static int s_slot2PreferredNetworkType = 26;
+static int s_slot2AllowedNetworkTypes = NR | LTE | WCDMA | GSM;
 static bool isNrDualConnectivityEnabled = true;
 
 static pthread_mutex_t s_state_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1692,13 +1707,11 @@ static int qmiLookupService(uint32_t service, uint32_t *out_node, uint32_t *out_
     return found ? 0 : -1;
 }
 
-static ssize_t qmiSendRecv(uint32_t node, uint32_t port, uint16_t msg_id,
-                           const uint8_t *tlvs, size_t tlv_len,
-                           uint8_t *resp, size_t resp_cap, int timeout_ms)
+static ssize_t qmiSendRecvFd(int fd, uint32_t node, uint32_t port, uint16_t msg_id,
+                             const uint8_t *tlvs, size_t tlv_len,
+                             uint8_t *resp, size_t resp_cap, int timeout_ms)
 {
-    if (tlv_len > 1000) return -1;
-    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
+    if (fd < 0 || tlv_len > 1000) return -1;
 
     struct timeval tv = {
         .tv_sec = timeout_ms / 1000,
@@ -1728,15 +1741,27 @@ static ssize_t qmiSendRecv(uint32_t node, uint32_t port, uint16_t msg_id,
     }
 
     if (sendto(fd, pkt, 7 + tlv_len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
-        close(fd);
         return -1;
     }
 
     ssize_t n = recv(fd, resp, resp_cap, 0);
-    close(fd);
     if (n < 7) return -1;
     uint16_t rmsg = (uint16_t)(resp[3] | (resp[4] << 8));
     if (rmsg != msg_id) return -1;
+    return n;
+}
+
+static ssize_t qmiSendRecv(uint32_t node, uint32_t port, uint16_t msg_id,
+                           const uint8_t *tlvs, size_t tlv_len,
+                           uint8_t *resp, size_t resp_cap, int timeout_ms)
+{
+    if (tlv_len > 1000) return -1;
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    ssize_t n = qmiSendRecvFd(fd, node, port, msg_id, tlvs, tlv_len,
+                              resp, resp_cap, timeout_ms);
+    close(fd);
     return n;
 }
 
@@ -1866,10 +1891,11 @@ static int qmiDmsGetBasebandVersion(char *out, size_t out_cap)
     return -1;
 }
 
-static int qmiDmsGetSerialNumbers(char *imei, size_t imei_cap,
-                                  char *imeisv, size_t imeisv_cap,
-                                  char *esn, size_t esn_cap,
-                                  char *meid, size_t meid_cap)
+static int qmiDmsGetSerialNumbersForSlot(int slot_id,
+                                         char *imei, size_t imei_cap,
+                                         char *imeisv, size_t imeisv_cap,
+                                         char *esn, size_t esn_cap,
+                                         char *meid, size_t meid_cap)
 {
     if (imei && imei_cap) imei[0] = '\0';
     if (imeisv && imeisv_cap) imeisv[0] = '\0';
@@ -1878,10 +1904,34 @@ static int qmiDmsGetSerialNumbers(char *imei, size_t imei_cap,
 
     if (qmiEnsureDms() < 0) return -1;
 
+    int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    /*
+     * Bind this QRTR client port to the requested subscription before reading
+     * serial numbers so SDX55 returns slot 1 (primary=1) or slot 2 (secondary=2)
+     * IMEI / IMEI SV / MEID cleanly.
+     */
+    uint32_t subs = (slot_id == 1) ? 2u /* DMS_SECONDARY_SUBS_V01 */
+                                   : 1u /* DMS_PRIMARY_SUBS_V01 */;
+    uint8_t bind_tlv[] = {
+        0x01, 0x04, 0x00,
+        (uint8_t)(subs & 0xff), (uint8_t)((subs >> 8) & 0xff),
+        (uint8_t)((subs >> 16) & 0xff), (uint8_t)((subs >> 24) & 0xff),
+    };
     uint8_t resp[512];
-    ssize_t n = qmiSendRecv(s_qmiDmsNode, s_qmiDmsPort,
-                            0x0025 /* QMI_DMS_GET_DEVICE_SERIAL_NUMBERS */,
-                            NULL, 0, resp, sizeof(resp), 2000);
+    ssize_t bn = qmiSendRecvFd(fd, s_qmiDmsNode, s_qmiDmsPort,
+                               0x0054 /* QMI_DMS_BIND_SUBSCRIPTION */,
+                               bind_tlv, sizeof(bind_tlv), resp, sizeof(resp), 2000);
+    if (bn <= 7 || qmiCheckResultTlv(resp, (size_t)bn, NULL) < 0) {
+        RLOGW("QMI DMS BIND_SUBSCRIPTION(slot=%d, subs=%u) failed (bn=%zd)", slot_id, subs, bn);
+    }
+
+    ssize_t n = qmiSendRecvFd(fd, s_qmiDmsNode, s_qmiDmsPort,
+                              0x0025 /* QMI_DMS_GET_DEVICE_SERIAL_NUMBERS */,
+                              NULL, 0, resp, sizeof(resp), 2000);
+    close(fd);
+
     if (n <= 7 || qmiCheckResultTlv(resp, (size_t)n, NULL) < 0) {
         s_qmiDmsResolved = 0;
         return -1;
@@ -1895,6 +1945,88 @@ static int qmiDmsGetSerialNumbers(char *imei, size_t imei_cap,
     }
     if (meid && meid_cap) qmiExtractStringTlv(resp, (size_t)n, 0x12, meid, meid_cap);
     return (imei && imei[0] != '\0') ? 0 : -1;
+}
+
+static int qmiDmsGetSerialNumbers(char *imei, size_t imei_cap,
+                                  char *imeisv, size_t imeisv_cap,
+                                  char *esn, size_t esn_cap,
+                                  char *meid, size_t meid_cap)
+{
+    return qmiDmsGetSerialNumbersForSlot(0, imei, imei_cap, imeisv, imeisv_cap,
+                                         esn, esn_cap, meid, meid_cap);
+}
+
+typedef struct {
+    int card_present;   /* 1 = PRESENT, 0 = ABSENT */
+    int slot_active;    /* 1 = ACTIVE, 0 = INACTIVE */
+    int logical_slot;   /* 0-based logical slot id */
+    char iccid[32];     /* ASCII ICCID digits */
+} QmiUimSlotInfo;
+
+static int qmiUimGetSlotsStatus(QmiUimSlotInfo *slots, int max_slots)
+{
+    if (!slots || max_slots <= 0) return -1;
+    if (qmiEnsureUim() < 0) return -1;
+
+    uint8_t resp[512];
+    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort,
+                            0x0047 /* QMI_UIM_GET_SLOTS_STATUS */,
+                            NULL, 0, resp, sizeof(resp), 2000);
+    if (n <= 7 || qmiCheckResultTlv(resp, (size_t)n, NULL) < 0) {
+        if (n < 0) s_qmiUimResolved = 0;
+        return -1;
+    }
+
+    size_t pos = 7;
+    while (pos + 3 <= (size_t)n) {
+        uint8_t t = resp[pos];
+        uint16_t l = (uint16_t)(resp[pos + 1] | (resp[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > (size_t)n) break;
+        if (t == 0x10 && l >= 1) {
+            size_t end = pos + l;
+            uint8_t num = resp[pos++];
+            int parsed = 0;
+            for (uint8_t i = 0; i < num && pos + 10 <= end; i++) {
+                uint32_t card_state = (uint32_t)resp[pos] |
+                                      ((uint32_t)resp[pos + 1] << 8) |
+                                      ((uint32_t)resp[pos + 2] << 16) |
+                                      ((uint32_t)resp[pos + 3] << 24);
+                pos += 4;
+                uint32_t slot_state = (uint32_t)resp[pos] |
+                                      ((uint32_t)resp[pos + 1] << 8) |
+                                      ((uint32_t)resp[pos + 2] << 16) |
+                                      ((uint32_t)resp[pos + 3] << 24);
+                pos += 4;
+                uint8_t logical_slot = resp[pos++];
+                uint8_t iccid_len = resp[pos++];
+                if (pos + iccid_len > end) break;
+
+                if (parsed < max_slots) {
+                    QmiUimSlotInfo *dst = &slots[parsed];
+                    memset(dst, 0, sizeof(*dst));
+                    dst->card_present = (card_state == 2u) ? 1 : 0;
+                    dst->slot_active = (slot_state == 1u) ? 1 : 0;
+                    dst->logical_slot = (logical_slot > 0) ? (int)(logical_slot - 1) : parsed;
+                    size_t out_i = 0;
+                    for (uint8_t b = 0; b < iccid_len && out_i + 2 < sizeof(dst->iccid); b++) {
+                        uint8_t lo = resp[pos + b] & 0x0f;
+                        uint8_t hi = (resp[pos + b] >> 4) & 0x0f;
+                        if (lo <= 9) dst->iccid[out_i++] = (char)('0' + lo);
+                        else break;
+                        if (hi <= 9) dst->iccid[out_i++] = (char)('0' + hi);
+                        else break;
+                    }
+                    dst->iccid[out_i] = '\0';
+                    parsed++;
+                }
+                pos += iccid_len;
+            }
+            return parsed;
+        }
+        pos += l;
+    }
+    return -1;
 }
 
 static int qmiNasSetModePreference(int raf_bitmap)
@@ -2486,8 +2618,7 @@ static void requestCdmaBaseBandVersion(int request __unused, void *data __unused
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
-static void requestDeviceIdentity(int request __unused, void *data __unused,
-                                        size_t datalen __unused, RIL_Token t)
+static void requestDeviceIdentityForSlot(int slot_id, RIL_Token t)
 {
     char imei[32] = {0};
     char imeisv[16] = {0};
@@ -2496,8 +2627,14 @@ static void requestDeviceIdentity(int request __unused, void *data __unused,
     char *responseStr[4];
     ATResponse *p_response = NULL;
 
-    if (qmiDmsGetSerialNumbers(imei, sizeof(imei), imeisv, sizeof(imeisv),
-                               esn, sizeof(esn), meid, sizeof(meid)) < 0) {
+    if (qmiDmsGetSerialNumbersForSlot(slot_id, imei, sizeof(imei),
+                                      imeisv, sizeof(imeisv),
+                                      esn, sizeof(esn),
+                                      meid, sizeof(meid)) < 0) {
+        if (slot_id != 0) {
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            return;
+        }
         int err = at_send_command_numeric("AT+CGSN", &p_response);
         if (err < 0 || p_response == NULL || p_response->success == 0 ||
             p_response->p_intermediates == NULL) {
@@ -2509,12 +2646,20 @@ static void requestDeviceIdentity(int request __unused, void *data __unused,
         at_response_free(p_response);
     }
 
+    RLOGI("DeviceIdentity(slot=%d): imei=%s imeisv=%s", slot_id, imei, imeisv);
+
     responseStr[0] = imei;
     responseStr[1] = imeisv;
     responseStr[2] = esn;
     responseStr[3] = meid;
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, 4 * sizeof(char *));
+}
+
+static void requestDeviceIdentity(int request __unused, void *data __unused,
+                                        size_t datalen __unused, RIL_Token t)
+{
+    requestDeviceIdentityForSlot(0, t);
 }
 
 static void requestCdmaGetSubscriptionSource(int request __unused, void *data,
@@ -4484,7 +4629,7 @@ static void requestGetRadioCapability(void *data, size_t datalen, RIL_Token t)
    radioCapability.session = 0;
    radioCapability.phase   = 0;
    radioCapability.rat     = NR | LTE | WCDMA | GSM;
-   strncpy(radioCapability.logicalModemUuid, "com.android.modem.simulator", MAX_UUID_LENGTH);
+   strncpy(radioCapability.logicalModemUuid, "com.qualcomm.qti.ril.modem0", MAX_UUID_LENGTH);
    radioCapability.status  = RC_STATUS_SUCCESS;
 
    RIL_onRequestComplete(t, RIL_E_SUCCESS, &radioCapability, sizeof(radioCapability));
@@ -5400,26 +5545,52 @@ static void requestStartKeepalive(void* data, size_t datalen __unused, RIL_Token
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &resp, sizeof(resp));
 }
 
-void getConfigSlotStatus(RIL_SimSlotStatus_V1_2 *pSimSlotStatus) {
-    if (pSimSlotStatus == NULL) {
+void getConfigSlotStatus(RIL_SimSlotStatus_V1_2 *pSimSlotStatusList, int count) {
+    if (pSimSlotStatusList == NULL || count <= 0) {
         return;
     }
-    if (getSIMStatus() == SIM_ABSENT) {
-        pSimSlotStatus->base.cardState = RIL_CARDSTATE_ABSENT;
-    } else {
-        pSimSlotStatus->base.cardState = RIL_CARDSTATE_PRESENT;
-    }
-    // TODO: slot state is always active now
-    pSimSlotStatus->base.slotState = SLOT_STATE_ACTIVE;
 
-    if (pSimSlotStatus->base.cardState != RIL_CARDSTATE_ABSENT) {
-        pSimSlotStatus->base.atr = "";
-        pSimSlotStatus->base.iccid = (char *)calloc(64, sizeof(char));
-        getIccId(pSimSlotStatus->base.iccid, 64);
-    }
+    QmiUimSlotInfo qmiSlots[SIM_COUNT];
+    int qmiCount = qmiUimGetSlotsStatus(qmiSlots, SIM_COUNT);
 
-    pSimSlotStatus->base.logicalSlotId = 0;
-    pSimSlotStatus->eid = "";
+    for (int i = 0; i < count; i++) {
+        RIL_SimSlotStatus_V1_2 *st = &pSimSlotStatusList[i];
+        if (qmiCount > i) {
+            st->base.cardState = qmiSlots[i].card_present ? RIL_CARDSTATE_PRESENT
+                                                          : RIL_CARDSTATE_ABSENT;
+            st->base.slotState = qmiSlots[i].slot_active ? SLOT_STATE_ACTIVE
+                                                         : SLOT_STATE_INACTIVE;
+            st->base.logicalSlotId = (uint32_t)qmiSlots[i].logical_slot;
+            if (st->base.cardState != RIL_CARDSTATE_ABSENT) {
+                st->base.atr = "";
+                st->base.iccid = (char *)calloc(64, sizeof(char));
+                if (st->base.iccid != NULL) {
+                    if (qmiSlots[i].iccid[0] != '\0') {
+                        snprintf(st->base.iccid, 64, "%s", qmiSlots[i].iccid);
+                    } else if (i == 0) {
+                        getIccId(st->base.iccid, 64);
+                    }
+                }
+            }
+        } else if (i == 0) {
+            st->base.cardState = (getSIMStatus() == SIM_ABSENT) ? RIL_CARDSTATE_ABSENT
+                                                                : RIL_CARDSTATE_PRESENT;
+            st->base.slotState = SLOT_STATE_ACTIVE;
+            st->base.logicalSlotId = 0;
+            if (st->base.cardState != RIL_CARDSTATE_ABSENT) {
+                st->base.atr = "";
+                st->base.iccid = (char *)calloc(64, sizeof(char));
+                if (st->base.iccid != NULL) {
+                    getIccId(st->base.iccid, 64);
+                }
+            }
+        } else {
+            st->base.cardState = RIL_CARDSTATE_ABSENT;
+            st->base.slotState = SLOT_STATE_ACTIVE;
+            st->base.logicalSlotId = (uint32_t)i;
+        }
+        st->eid = "";
+    }
 }
 
 void sendUnsolNetworkScanResult(void *param __unused) {
@@ -5436,7 +5607,7 @@ void onIccSlotStatus(RIL_Token t) {
     RIL_SimSlotStatus_V1_2 *pSimSlotStatusList =
         (RIL_SimSlotStatus_V1_2 *)calloc(SIM_COUNT, sizeof(RIL_SimSlotStatus_V1_2));
 
-    getConfigSlotStatus(pSimSlotStatusList);
+    getConfigSlotStatus(pSimSlotStatusList, SIM_COUNT);
 
     if (t == NULL) {
         RIL_onUnsolicitedResponse(RIL_UNSOL_CONFIG_ICC_SLOT_STATUS, pSimSlotStatusList,
@@ -5447,10 +5618,339 @@ void onIccSlotStatus(RIL_Token t) {
     }
 
     if (pSimSlotStatusList != NULL) {
-        free(pSimSlotStatusList->base.iccid);
+        for (int i = 0; i < SIM_COUNT; i++) {
+            free(pSimSlotStatusList[i].base.iccid);
+        }
         free(pSimSlotStatusList);
     }
 }
+
+#if defined(ANDROID_MULTI_SIM)
+/*
+ * Secondary SIM slot (slot2) handler for DSDS.
+ *
+ * SDX55 exposes a single MHI AT channel (/dev/wwan0at0), owned by slot1.
+ * Never issue AT commands or mutate slot1 state from here: answer identity
+ * (IMEI 2, IMEI SV, baseband) via QMI DMS, physical card presence via QMI
+ * UIM, and radio/network queries cleanly so Android exposes full dual-SIM
+ * metadata without interfering with slot1 5G/LTE/IMS.
+ */
+static void
+onRequestSlot2(int request, void *data, size_t datalen, RIL_Token t)
+{
+    RLOGD("onRequestSlot2: %s, sStateSlot2: %d", requestToString(request), sStateSlot2);
+
+    if (sStateSlot2 == RADIO_STATE_UNAVAILABLE) {
+        switch (request) {
+            case RIL_REQUEST_GET_SIM_STATUS:
+            case RIL_REQUEST_DEVICE_IDENTITY:
+            case RIL_REQUEST_GET_IMEI:
+            case RIL_REQUEST_GET_IMEISV:
+            case RIL_REQUEST_BASEBAND_VERSION:
+            case RIL_REQUEST_GET_RADIO_CAPABILITY:
+            case RIL_REQUEST_GET_MODEM_STACK_STATUS:
+            case RIL_REQUEST_ENABLE_MODEM:
+            case RIL_REQUEST_CONFIG_GET_SLOT_STATUS:
+            case RIL_REQUEST_CONFIG_SET_SLOT_MAPPING:
+            case RIL_REQUEST_CONFIG_GET_PHONE_CAPABILITY:
+            case RIL_REQUEST_CONFIG_SET_MODEM_CONFIG:
+            case RIL_REQUEST_CONFIG_GET_MODEM_CONFIG:
+            case RIL_REQUEST_CONFIG_SET_PREFER_DATA_MODEM:
+                break;
+            default:
+                RIL_onRequestComplete(t, RIL_E_RADIO_NOT_AVAILABLE, NULL, 0);
+                return;
+        }
+    }
+
+    switch (request) {
+        case RIL_REQUEST_GET_SIM_STATUS: {
+            RIL_CardStatus_v1_5 *p_card_status =
+                    (RIL_CardStatus_v1_5 *)calloc(1, sizeof(RIL_CardStatus_v1_5));
+            if (p_card_status == NULL) {
+                RIL_onRequestComplete(t, RIL_E_NO_MEMORY, NULL, 0);
+                break;
+            }
+            p_card_status->base.base.base.card_state = RIL_CARDSTATE_ABSENT;
+            p_card_status->base.base.base.universal_pin_state = RIL_PINSTATE_UNKNOWN;
+            p_card_status->base.base.base.gsm_umts_subscription_app_index = -1;
+            p_card_status->base.base.base.cdma_subscription_app_index = -1;
+            p_card_status->base.base.base.ims_subscription_app_index = -1;
+            p_card_status->base.base.base.num_applications = 0;
+            p_card_status->base.base.physicalSlotId = 1;
+            p_card_status->base.base.atr = NULL;
+            p_card_status->base.base.iccid = NULL;
+            p_card_status->base.eid = "";
+
+            QmiUimSlotInfo qmiSlots[SIM_COUNT];
+            int qmiCount = qmiUimGetSlotsStatus(qmiSlots, SIM_COUNT);
+            if (qmiCount >= 2 && qmiSlots[1].card_present) {
+                p_card_status->base.base.base.card_state = RIL_CARDSTATE_PRESENT;
+                if (qmiSlots[1].iccid[0] != '\0') {
+                    p_card_status->base.base.iccid = strdup(qmiSlots[1].iccid);
+                }
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, p_card_status, sizeof(*p_card_status));
+            freeCardStatus(p_card_status);
+            break;
+        }
+        case RIL_REQUEST_DEVICE_IDENTITY:
+            requestDeviceIdentityForSlot(1, t);
+            break;
+        case RIL_REQUEST_GET_IMEI: {
+            char imei[32] = {0};
+            if (qmiDmsGetSerialNumbersForSlot(1, imei, sizeof(imei),
+                                              NULL, 0, NULL, 0, NULL, 0) == 0) {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, imei, strlen(imei) + 1);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            }
+            break;
+        }
+        case RIL_REQUEST_GET_IMEISV: {
+            char imei[32] = {0};
+            char imeisv[16] = {0};
+            if (qmiDmsGetSerialNumbersForSlot(1, imei, sizeof(imei),
+                                              imeisv, sizeof(imeisv),
+                                              NULL, 0, NULL, 0) == 0 &&
+                imeisv[0] != '\0') {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, imeisv, strlen(imeisv) + 1);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            }
+            break;
+        }
+        case RIL_REQUEST_BASEBAND_VERSION: {
+            char ver[256] = {0};
+            if (qmiDmsGetBasebandVersion(ver, sizeof(ver)) == 0) {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, ver, strlen(ver) + 1);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            }
+            break;
+        }
+        case RIL_REQUEST_RADIO_POWER: {
+            int onOff = (data != NULL && datalen >= sizeof(int)) ? ((int *)data)[0] : 0;
+            RIL_RadioState next = onOff ? RADIO_STATE_ON : RADIO_STATE_OFF;
+            RIL_RadioState prev;
+            pthread_mutex_lock(&s_state_mutex);
+            prev = sStateSlot2;
+            sStateSlot2 = next;
+            pthread_mutex_unlock(&s_state_mutex);
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            if (prev != next) {
+                RIL_onUnsolicitedResponseForSlot(RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED,
+                                                 NULL, 0, RIL_SOCKET_2);
+            }
+            break;
+        }
+        case RIL_REQUEST_SHUTDOWN: {
+            RIL_RadioState prev;
+            pthread_mutex_lock(&s_state_mutex);
+            prev = sStateSlot2;
+            sStateSlot2 = RADIO_STATE_OFF;
+            pthread_mutex_unlock(&s_state_mutex);
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            if (prev != RADIO_STATE_OFF) {
+                RIL_onUnsolicitedResponseForSlot(RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED,
+                                                 NULL, 0, RIL_SOCKET_2);
+            }
+            break;
+        }
+        case RIL_REQUEST_GET_RADIO_CAPABILITY: {
+            RIL_RadioCapability rc;
+            memset(&rc, 0, sizeof(rc));
+            rc.version = RIL_RADIO_CAPABILITY_VERSION;
+            rc.session = 0;
+            rc.phase = 0;
+            rc.rat = NR | LTE | WCDMA | GSM;
+            strncpy(rc.logicalModemUuid, "com.qualcomm.qti.ril.modem1", MAX_UUID_LENGTH);
+            rc.status = RC_STATUS_SUCCESS;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &rc, sizeof(rc));
+            break;
+        }
+        case RIL_REQUEST_SET_RADIO_CAPABILITY:
+            requestSetRadioCapability(data, datalen, t);
+            break;
+        case RIL_REQUEST_VOICE_REGISTRATION_STATE: {
+            char *resp[REG_STATE_LEN];
+            memset(resp, 0, sizeof(resp));
+            resp[0] = (char *)"0";
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, resp, sizeof(resp));
+            break;
+        }
+        case RIL_REQUEST_DATA_REGISTRATION_STATE: {
+            char *resp[REG_DATA_STATE_LEN];
+            memset(resp, 0, sizeof(resp));
+            resp[0] = (char *)"0";
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, resp, sizeof(resp));
+            break;
+        }
+        case RIL_REQUEST_OPERATOR: {
+            char *resp[3] = { NULL, NULL, NULL };
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, resp, sizeof(resp));
+            break;
+        }
+        case RIL_REQUEST_SIGNAL_STRENGTH: {
+            RIL_SignalStrength_v12 ss;
+            initEmptySignalStrength(&ss);
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &ss, sizeof(ss));
+            break;
+        }
+        case RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE: {
+            int mode = 0;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &mode, sizeof(mode));
+            break;
+        }
+        case RIL_REQUEST_DATA_CALL_LIST:
+        case RIL_REQUEST_GET_CURRENT_CALLS:
+        case RIL_REQUEST_GET_CELL_INFO_LIST:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
+        case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &s_slot2PreferredNetworkType,
+                                  sizeof(s_slot2PreferredNetworkType));
+            break;
+        case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE:
+            if (data != NULL && datalen >= sizeof(int)) {
+                s_slot2PreferredNetworkType = *(int *)data;
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
+        case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE_BITMAP:
+        case RIL_REQUEST_GET_ALLOWED_NETWORK_TYPES_BITMAP:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &s_slot2AllowedNetworkTypes,
+                                  sizeof(s_slot2AllowedNetworkTypes));
+            break;
+        case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE_BITMAP:
+        case RIL_REQUEST_SET_ALLOWED_NETWORK_TYPES_BITMAP:
+            if (data != NULL && datalen >= sizeof(int)) {
+                s_slot2AllowedNetworkTypes = *(int *)data;
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
+        case RIL_REQUEST_GET_ACTIVITY_INFO:
+            requestGetActivityInfo(data, datalen, t);
+            break;
+        case RIL_REQUEST_GET_HARDWARE_CONFIG:
+            requestGetHardwareConfig(data, datalen, t);
+            break;
+        case RIL_REQUEST_GET_CARRIER_RESTRICTIONS:
+            requestGetCarrierRestrictions(data, datalen, t);
+            break;
+        case RIL_REQUEST_GET_MUTE: {
+            int mute = 0;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &mute, sizeof(mute));
+            break;
+        }
+        case RIL_REQUEST_QUERY_TTY_MODE: {
+            int tty = 0;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &tty, sizeof(tty));
+            break;
+        }
+        case RIL_REQUEST_VOICE_RADIO_TECH: {
+            int tech = RADIO_TECH_UNKNOWN;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &tech, sizeof(tech));
+            break;
+        }
+        case RIL_REQUEST_ARE_UICC_APPLICATIONS_ENABLED: {
+            bool enabled = true;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &enabled, sizeof(enabled));
+            break;
+        }
+        case RIL_REQUEST_IS_NR_DUAL_CONNECTIVITY_ENABLED:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &isNrDualConnectivityEnabled,
+                                  sizeof(isNrDualConnectivityEnabled));
+            break;
+        case RIL_REQUEST_QUERY_AVAILABLE_BAND_MODE: {
+            int size = 5;
+            int response[20] = {0};
+            for (int i = 1; i <= size; i++) {
+                response[i] = i - 1;
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, response, (size + 1) * sizeof(int));
+            break;
+        }
+        case RIL_REQUEST_GET_MODEM_STACK_STATUS:
+        case RIL_REQUEST_ENABLE_MODEM:
+        case RIL_REQUEST_ALLOW_DATA:
+        case RIL_REQUEST_SET_DATA_PROFILE:
+        case RIL_REQUEST_SET_INITIAL_ATTACH_APN:
+        case RIL_REQUEST_SCREEN_STATE:
+        case RIL_REQUEST_SET_UNSOLICITED_RESPONSE_FILTER:
+        case RIL_REQUEST_SET_SIGNAL_STRENGTH_REPORTING_CRITERIA:
+        case RIL_REQUEST_SET_LINK_CAPACITY_REPORTING_CRITERIA:
+        case RIL_REQUEST_SET_SYSTEM_SELECTION_CHANNELS:
+        case RIL_REQUEST_SET_LOCATION_UPDATES:
+        case RIL_REQUEST_SET_UNSOL_CELL_INFO_LIST_RATE:
+        case RIL_REQUEST_SET_TTY_MODE:
+        case RIL_REQUEST_SET_MUTE:
+        case RIL_REQUEST_SET_SIM_CARD_POWER:
+        case RIL_REQUEST_ENABLE_UICC_APPLICATIONS:
+        case RIL_REQUEST_ENABLE_NR_DUAL_CONNECTIVITY:
+        case RIL_REQUEST_SET_DATA_THROTTLING:
+        case RIL_REQUEST_SET_CARRIER_RESTRICTIONS:
+        case RIL_REQUEST_SET_BAND_MODE:
+        case RIL_REQUEST_GET_BARRING_INFO:
+        case RIL_REQUEST_GET_SLICING_CONFIG:
+        case RIL_REQUEST_GET_NEIGHBORING_CELL_IDS:
+        case RIL_REQUEST_CDMA_SET_SUBSCRIPTION_SOURCE:
+        case RIL_REQUEST_CDMA_SET_ROAMING_PREFERENCE:
+        case RIL_REQUEST_CDMA_SET_PREFERRED_VOICE_PRIVACY_MODE:
+        case RIL_REQUEST_EXIT_EMERGENCY_CALLBACK_MODE:
+        case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
+        case RIL_REQUEST_CONFIG_GET_SLOT_STATUS:
+            RIL_requestTimedCallback(onIccSlotStatus, (void *)t, NULL);
+            break;
+        case RIL_REQUEST_CONFIG_SET_SLOT_MAPPING:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
+        case RIL_REQUEST_CONFIG_GET_PHONE_CAPABILITY: {
+            RIL_PhoneCapability phoneCapability;
+            memset(&phoneCapability, 0, sizeof(phoneCapability));
+            phoneCapability.maxActiveData = 1;
+            phoneCapability.maxActiveInternetData = 1;
+            phoneCapability.isInternetLingeringSupported = false;
+            for (int num = 0; num < SIM_COUNT; num++) {
+                phoneCapability.logicalModemList[num].modemId = num;
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &phoneCapability, sizeof(phoneCapability));
+            break;
+        }
+        case RIL_REQUEST_CONFIG_GET_MODEM_CONFIG: {
+            RIL_ModemConfig mdConfig;
+            mdConfig.numOfLiveModems = SIM_COUNT;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &mdConfig, sizeof(RIL_ModemConfig));
+            break;
+        }
+        case RIL_REQUEST_CONFIG_SET_MODEM_CONFIG: {
+            RIL_ModemConfig *mdConfig = (RIL_ModemConfig *)data;
+            if (mdConfig == NULL || mdConfig->numOfLiveModems < 1 ||
+                mdConfig->numOfLiveModems > SIM_COUNT) {
+                RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            }
+            break;
+        }
+        case RIL_REQUEST_CONFIG_SET_PREFER_DATA_MODEM: {
+            int *modemId = (int *)data;
+            if (modemId == NULL || *modemId < 0 || *modemId >= SIM_COUNT) {
+                RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            }
+            break;
+        }
+        default:
+            RLOGD("onRequestSlot2: Request %s not supported", requestToString(request));
+            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
+            break;
+    }
+}
+#endif
 
 /*** Callback methods from the RIL library to us ***/
 
@@ -5466,9 +5966,20 @@ void onIccSlotStatus(RIL_Token t) {
  * we must ensure that the underlying at_send_command_* function
  * is atomic.
  */
+#if defined(ANDROID_MULTI_SIM)
+static void
+onRequest (int request, void *data, size_t datalen, RIL_Token t,
+           RIL_SOCKET_ID socket_id)
+{
+    if (socket_id != RIL_SOCKET_1) {
+        onRequestSlot2(request, data, datalen, t);
+        return;
+    }
+#else
 static void
 onRequest (int request, void *data, size_t datalen, RIL_Token t)
 {
+#endif
     ATResponse *p_response;
     int err;
 
@@ -6093,6 +6604,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             break;
         case RIL_REQUEST_GET_ALLOWED_NETWORK_TYPES_BITMAP:
             requestGetPreferredNetworkType(request, data, datalen, t);
+            break;
         case RIL_REQUEST_ENABLE_NR_DUAL_CONNECTIVITY:
             if (data == NULL || datalen != sizeof(int)) {
                 RIL_onRequestComplete(t, RIL_E_INTERNAL_ERR, NULL, 0);
@@ -6117,6 +6629,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             break;
         case RIL_REQUEST_GET_CARRIER_RESTRICTIONS:
             requestGetCarrierRestrictions(data, datalen, t);
+            break;
 
         // Radio config requests
         case RIL_REQUEST_CONFIG_GET_SLOT_STATUS:
@@ -6128,6 +6641,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_CONFIG_GET_PHONE_CAPABILITY: {
             RIL_PhoneCapability *phoneCapability =
                     (RIL_PhoneCapability *)alloca(sizeof(RIL_PhoneCapability));
+            memset(phoneCapability, 0, sizeof(RIL_PhoneCapability));
             phoneCapability->maxActiveData = 1;
             // DSDS is 1, and DSDA is 2, now only support DSDS
             phoneCapability->maxActiveInternetData = 1;
@@ -6142,7 +6656,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
         case RIL_REQUEST_CONFIG_SET_MODEM_CONFIG: {
             RIL_ModemConfig *mdConfig = (RIL_ModemConfig*)(data);
-            if (mdConfig == NULL || mdConfig->numOfLiveModems != 1) {
+            if (mdConfig == NULL || mdConfig->numOfLiveModems < 1 ||
+                mdConfig->numOfLiveModems > SIM_COUNT) {
                 RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
             } else {
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -6151,14 +6666,14 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
         case RIL_REQUEST_CONFIG_GET_MODEM_CONFIG: {
             RIL_ModemConfig mdConfig;
-            mdConfig.numOfLiveModems = 1;
+            mdConfig.numOfLiveModems = SIM_COUNT;
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, &mdConfig, sizeof(RIL_ModemConfig));
             break;
         }
         case RIL_REQUEST_CONFIG_SET_PREFER_DATA_MODEM: {
             int *modemId = (int*)(data);
-            if (modemId == NULL || *modemId != 0) {
+            if (modemId == NULL || *modemId < 0 || *modemId >= SIM_COUNT) {
                 RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
             } else {
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -6225,11 +6740,22 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
  * Synchronous call from the RIL to us to return current radio state.
  * RADIO_STATE_UNAVAILABLE should be the initial state.
  */
+#if defined(ANDROID_MULTI_SIM)
+static RIL_RadioState
+currentState(RIL_SOCKET_ID socket_id)
+{
+    if (socket_id != RIL_SOCKET_1) {
+        return sStateSlot2;
+    }
+    return sState;
+}
+#else
 static RIL_RadioState
 currentState()
 {
     return sState;
 }
+#endif
 /**
  * Call from RIL to us to find out whether a specific request code
  * is supported by this implementation.
@@ -6281,6 +6807,7 @@ setRadioState(RIL_RadioState newState)
 {
     RLOGD("setRadioState(%d)", newState);
     RIL_RadioState oldState;
+    int slot2Changed = 0;
 
     pthread_mutex_lock(&s_state_mutex);
 
@@ -6300,6 +6827,16 @@ setRadioState(RIL_RadioState newState)
 
         pthread_cond_broadcast (&s_state_cond);
     }
+
+#if defined(ANDROID_MULTI_SIM)
+    if (newState == RADIO_STATE_UNAVAILABLE && sStateSlot2 != RADIO_STATE_UNAVAILABLE) {
+        sStateSlot2 = RADIO_STATE_UNAVAILABLE;
+        slot2Changed = 1;
+    } else if (sStateSlot2 == RADIO_STATE_UNAVAILABLE && newState != RADIO_STATE_UNAVAILABLE) {
+        sStateSlot2 = newState;
+        slot2Changed = 1;
+    }
+#endif
 
     pthread_mutex_unlock(&s_state_mutex);
 
@@ -6321,6 +6858,16 @@ setRadioState(RIL_RadioState newState)
             onRadioPowerOn();
         }
     }
+#if defined(ANDROID_MULTI_SIM)
+    if (slot2Changed) {
+        RIL_onUnsolicitedResponseForSlot(RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED,
+                                         NULL, 0, RIL_SOCKET_2);
+        RIL_onUnsolicitedResponseForSlot(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED,
+                                         NULL, 0, RIL_SOCKET_2);
+    }
+#else
+    (void)slot2Changed;
+#endif
 }
 
 /** Returns RUIM_NOT_READY on error */
