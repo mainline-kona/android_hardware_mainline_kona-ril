@@ -5,6 +5,7 @@
 
 cc_binary {
     name: "kona-dataconn",
+    vendor: true,
     defaults: [
         "libqmi_glib_dep_defaults",
         "libqmi_libqmi_glib_dep_defaults",

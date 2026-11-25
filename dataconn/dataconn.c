@@ -65,12 +65,13 @@ static guint read_sysfs_uint(const char *path) {
 
 static const char *get_parent_iface(void) {
     for (int retry = 0; retry < 10; retry++) {
+        if (if_nametoindex("mhi_hwip0") > 0) return "mhi_hwip0";
         if (if_nametoindex("wwan0") > 0) return "wwan0";
         if (if_nametoindex("rmnet_mhi0") > 0) return "rmnet_mhi0";
         if (if_nametoindex("rmnet_ipa0") > 0) return "rmnet_ipa0";
         usleep(100000);
     }
-    return "wwan0";
+    return "mhi_hwip0";
 }
 
 static void get_endpoint_info(const char *parent, QmiDataEndpointType *ep_type, guint *ep_index) {
@@ -206,6 +207,103 @@ static void on_packet_service_status(QmiClientWds *wds, QmiIndicationWdsPacketSe
     g_main_loop_quit(loop);
 }
 
+static QrtrNode *find_wds_node(QrtrBus *bus) {
+    GList *nodes = qrtr_bus_peek_nodes(bus);
+    for (GList *l = nodes; l != NULL; l = l->next) {
+        QrtrNode *n = QRTR_NODE(l->data);
+        if (qrtr_node_lookup_port(n, QMI_SERVICE_WDS) >= 0) {
+            return g_object_ref(n);
+        }
+    }
+    return NULL;
+}
+
+static void release_client(QmiDevice *dev, QmiClient *client, Wait *w) {
+    if (!client) return;
+    GError *error = NULL;
+    qmi_device_release_client(dev, client, QMI_DEVICE_RELEASE_CLIENT_FLAGS_RELEASE_CID, 5, NULL,
+                              on_done, w);
+    qmi_device_release_client_finish(dev, wait_result(w), &error);
+    g_clear_error(&error);
+    g_object_unref(client);
+}
+
+static void ensure_modem_online(QmiDevice *dev, Wait *w) {
+    GError *error = NULL;
+    qmi_device_allocate_client(dev, QMI_SERVICE_DMS, QMI_CID_NONE, 10, NULL, on_done, w);
+    QmiClient *dms = qmi_device_allocate_client_finish(dev, wait_result(w), &error);
+    if (!dms) {
+        g_clear_error(&error);
+        return;
+    }
+    qmi_client_dms_get_operating_mode(QMI_CLIENT_DMS(dms), NULL, 10, NULL, on_done, w);
+    g_autoptr(QmiMessageDmsGetOperatingModeOutput) out =
+            qmi_client_dms_get_operating_mode_finish(QMI_CLIENT_DMS(dms), wait_result(w), &error);
+    if (out && qmi_message_dms_get_operating_mode_output_get_result(out, &error)) {
+        QmiDmsOperatingMode mode = QMI_DMS_OPERATING_MODE_ONLINE;
+        qmi_message_dms_get_operating_mode_output_get_mode(out, &mode, NULL);
+        if (mode != QMI_DMS_OPERATING_MODE_ONLINE) {
+            g_autoptr(QmiMessageDmsSetOperatingModeInput) sin =
+                    qmi_message_dms_set_operating_mode_input_new();
+            qmi_message_dms_set_operating_mode_input_set_mode(sin, QMI_DMS_OPERATING_MODE_ONLINE,
+                                                              NULL);
+            qmi_client_dms_set_operating_mode(QMI_CLIENT_DMS(dms), sin, 10, NULL, on_done, w);
+            g_autoptr(QmiMessageDmsSetOperatingModeOutput) sout =
+                    qmi_client_dms_set_operating_mode_finish(QMI_CLIENT_DMS(dms), wait_result(w),
+                                                             &error);
+            if (!sout || !qmi_message_dms_set_operating_mode_output_get_result(sout, &error)) {
+                printf("warning=dms set online: %s\n", error ? error->message : "unknown");
+                g_clear_error(&error);
+            }
+        }
+    } else {
+        g_clear_error(&error);
+    }
+    release_client(dev, dms, w);
+}
+
+/*
+ * Query raw WDS GetCurrentSettings (0x002D) TLV 0x2E for IPv6 P-CSCF addresses,
+ * which libqmi's generated WDS JSON does not expose as a typed getter.
+ */
+static void print_ipv6_pcscf(QmiDevice *dev, QmiClient *wds6, Wait *w) {
+    GError *error = NULL;
+    g_autoptr(QmiMessage) msg =
+            qmi_message_new(QMI_SERVICE_WDS, qmi_client_get_cid(wds6), 0, 0x002D);
+    gsize tlv = qmi_message_tlv_write_init(msg, 0x10, NULL);
+    qmi_message_tlv_write_guint32(
+            msg, QMI_ENDIAN_LITTLE,
+            QMI_WDS_REQUESTED_SETTINGS_PCSCF_SERVER_ADDRESS_LIST |
+                    QMI_WDS_REQUESTED_SETTINGS_PCSCF_DOMAIN_NAME_LIST,
+            NULL);
+    qmi_message_tlv_write_complete(msg, tlv, NULL);
+
+    qmi_device_command_full(dev, msg, NULL, 10, NULL, on_done, w);
+    g_autoptr(QmiMessage) resp = qmi_device_command_full_finish(dev, wait_result(w), &error);
+    if (!resp) {
+        g_clear_error(&error);
+        return;
+    }
+    guint16 tlv_len = 0;
+    gsize init = qmi_message_tlv_read_init(resp, 0x2E, &tlv_len, NULL);
+    if (!init || tlv_len < 17) return;
+    gsize off = 0;
+    guint8 count = 0;
+    if (!qmi_message_tlv_read_guint8(resp, init, &off, &count, NULL)) return;
+    for (guint8 i = 0; i < count && (off + 16) <= tlv_len; i++) {
+        struct in6_addr addr6;
+        for (int j = 0; j < 16; j++) {
+            guint8 b = 0;
+            if (!qmi_message_tlv_read_guint8(resp, init, &off, &b, NULL)) return;
+            addr6.s6_addr[j] = b;
+        }
+        char buf6[INET6_ADDRSTRLEN];
+        if (inet_ntop(AF_INET6, &addr6, buf6, sizeof(buf6))) {
+            printf("pcscf=%s\n", buf6);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     GError *error = NULL;
     Wait w = {.loop = g_main_loop_new(NULL, FALSE)};
@@ -218,9 +316,16 @@ int main(int argc, char **argv) {
     g_autoptr(QrtrBus) bus = qrtr_bus_new_finish(wait_result(&w), &error);
     if (!bus) fail("open qrtr bus", error);
 
-    /* The modem's node only shows up once it has booted */
-    qrtr_bus_wait_for_node(bus, 0, 30000, NULL, on_done, &w);
-    g_autoptr(QrtrNode) node = qrtr_bus_wait_for_node_finish(bus, wait_result(&w), &error);
+    /*
+     * On OnePlus 8T (SM8250 + external SDX55 over MHI), the modem exposes
+     * QMI WDS/WDA on QRTR node 3 rather than node 0. Prefer any node already
+     * advertising QMI_SERVICE_WDS, then fall back to node 3.
+     */
+    g_autoptr(QrtrNode) node = find_wds_node(bus);
+    if (!node) {
+        qrtr_bus_wait_for_node(bus, 3, 30000, NULL, on_done, &w);
+        node = qrtr_bus_wait_for_node_finish(bus, wait_result(&w), &error);
+    }
     if (!node) fail("find modem node", error);
 
     qmi_device_new_from_node(node, NULL, on_done, &w);
@@ -229,6 +334,8 @@ int main(int argc, char **argv) {
 
     qmi_device_open(dev, QMI_DEVICE_OPEN_FLAGS_NONE, 15, NULL, on_done, &w);
     if (!qmi_device_open_finish(dev, wait_result(&w), &error)) fail("open device", error);
+
+    ensure_modem_online(dev, &w);
 
     const char *parent = get_parent_iface();
     QmiDataEndpointType ep_type = QMI_DATA_ENDPOINT_TYPE_PCIE;
@@ -271,23 +378,58 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * Check current WDA format first: when a second APN (e.g. ims) comes up
+     * alongside an active internet session, re-sending WDA_SET_DATA_FORMAT can
+     * fail with DeviceInUse or disrupt the active muxed link.
+     */
     {
-        g_autoptr(QmiMessageWdaSetDataFormatInput) in = qmi_message_wda_set_data_format_input_new();
-        qmi_message_wda_set_data_format_input_set_link_layer_protocol(
-                in, QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP, NULL);
-        qmi_message_wda_set_data_format_input_set_uplink_data_aggregation_protocol(
-                in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
-        qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_protocol(
-                in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
-        qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_size(in, 32768, NULL);
-        qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_datagrams(in, 32, NULL);
-        qmi_message_wda_set_data_format_input_set_endpoint_info(
-                in, ep_type, ep_index, NULL);
-        qmi_client_wda_set_data_format(QMI_CLIENT_WDA(wda), in, 10, NULL, on_done, &w);
-        g_autoptr(QmiMessageWdaSetDataFormatOutput) out =
-                qmi_client_wda_set_data_format_finish(QMI_CLIENT_WDA(wda), wait_result(&w), &error);
-        if (!out || !qmi_message_wda_set_data_format_output_get_result(out, &error))
-            fail("set data format", error);
+        gboolean need_set = TRUE;
+        g_autoptr(QmiMessageWdaGetDataFormatInput) gin =
+                qmi_message_wda_get_data_format_input_new();
+        qmi_message_wda_get_data_format_input_set_endpoint_info(gin, ep_type, ep_index, NULL);
+        qmi_client_wda_get_data_format(QMI_CLIENT_WDA(wda), gin, 10, NULL, on_done, &w);
+        g_autoptr(QmiMessageWdaGetDataFormatOutput) gout =
+                qmi_client_wda_get_data_format_finish(QMI_CLIENT_WDA(wda), wait_result(&w), &error);
+        if (gout && qmi_message_wda_get_data_format_output_get_result(gout, &error)) {
+            QmiWdaLinkLayerProtocol llp = QMI_WDA_LINK_LAYER_PROTOCOL_UNKNOWN;
+            QmiWdaDataAggregationProtocol ul = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
+            QmiWdaDataAggregationProtocol dl = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
+            qmi_message_wda_get_data_format_output_get_link_layer_protocol(gout, &llp, NULL);
+            qmi_message_wda_get_data_format_output_get_uplink_data_aggregation_protocol(gout, &ul,
+                                                                                        NULL);
+            qmi_message_wda_get_data_format_output_get_downlink_data_aggregation_protocol(gout, &dl,
+                                                                                          NULL);
+            if (llp == QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP &&
+                ul == QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5 &&
+                dl == QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5) {
+                need_set = FALSE;
+            }
+        } else {
+            g_clear_error(&error);
+        }
+
+        if (need_set) {
+            g_autoptr(QmiMessageWdaSetDataFormatInput) in =
+                    qmi_message_wda_set_data_format_input_new();
+            qmi_message_wda_set_data_format_input_set_link_layer_protocol(
+                    in, QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP, NULL);
+            qmi_message_wda_set_data_format_input_set_uplink_data_aggregation_protocol(
+                    in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
+            qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_protocol(
+                    in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
+            qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_size(in, 32768,
+                                                                                         NULL);
+            qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_datagrams(
+                    in, 32, NULL);
+            qmi_message_wda_set_data_format_input_set_endpoint_info(in, ep_type, ep_index, NULL);
+            qmi_client_wda_set_data_format(QMI_CLIENT_WDA(wda), in, 10, NULL, on_done, &w);
+            g_autoptr(QmiMessageWdaSetDataFormatOutput) out =
+                    qmi_client_wda_set_data_format_finish(QMI_CLIENT_WDA(wda), wait_result(&w),
+                                                          &error);
+            if (!out || !qmi_message_wda_set_data_format_output_get_result(out, &error))
+                fail("set data format", error);
+        }
     }
 
     set_iface_up(parent);
@@ -374,6 +516,7 @@ int main(int argc, char **argv) {
                 QMI_WDS_REQUESTED_SETTINGS_DNS_ADDRESS |
                 QMI_WDS_REQUESTED_SETTINGS_MTU |
                 QMI_WDS_REQUESTED_SETTINGS_PCSCF_SERVER_ADDRESS_LIST |
+                QMI_WDS_REQUESTED_SETTINGS_PCSCF_DOMAIN_NAME_LIST |
                 QMI_WDS_REQUESTED_SETTINGS_IP_FAMILY,
                 NULL);
         qmi_client_wds_get_current_settings(QMI_CLIENT_WDS(wds4), in, 10, NULL, on_done, &w);
@@ -417,6 +560,7 @@ int main(int argc, char **argv) {
                 QMI_WDS_REQUESTED_SETTINGS_DNS_ADDRESS |
                 QMI_WDS_REQUESTED_SETTINGS_MTU |
                 QMI_WDS_REQUESTED_SETTINGS_PCSCF_SERVER_ADDRESS_LIST |
+                QMI_WDS_REQUESTED_SETTINGS_PCSCF_DOMAIN_NAME_LIST |
                 QMI_WDS_REQUESTED_SETTINGS_IP_FAMILY,
                 NULL);
         qmi_client_wds_get_current_settings(QMI_CLIENT_WDS(wds6), in, 10, NULL, on_done, &w);
@@ -467,6 +611,7 @@ int main(int argc, char **argv) {
                     if (domain && domain[0]) printf("pcscf=%s\n", domain);
                 }
             }
+            print_ipv6_pcscf(dev, wds6, &w);
         } else {
             g_clear_error(&error);
         }
@@ -505,5 +650,8 @@ int main(int argc, char **argv) {
     }
     qmi_device_delete_link(dev, ifname, mux_id, NULL, on_done, &w);
     qmi_device_delete_link_finish(dev, wait_result(&w), NULL);
+    release_client(dev, wds6, &w);
+    release_client(dev, wds4, &w);
+    release_client(dev, wda, &w);
     return 0;
 }
