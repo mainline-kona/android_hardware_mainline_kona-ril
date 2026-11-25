@@ -3026,7 +3026,7 @@ static void requestSimAuthentication(int authContext, char* authData, RIL_Token 
         if (binSimResponse == NULL) goto close_channel;
         response.simResponse = (char *)malloc(2 * binSimResponseLen + 4);
         if (response.simResponse == NULL) goto close_channel;
-        base64_encode(binSimResponse, binSimResponseLen, response.simResponse);
+        base64_encode(binSimResponse, response.simResponse, binSimResponseLen);
     } else {
         response.simResponse = strdup("");
     }
