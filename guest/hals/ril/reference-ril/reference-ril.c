@@ -986,6 +986,8 @@ static int startDataconn(const char *apn, const char *pdp_type) {
         } else if (!strncmp(line, "pcscf=", 6)) {
             if (s->pcscf[0]) strlcat(s->pcscf, " ", sizeof(s->pcscf));
             strlcat(s->pcscf, line + 6, sizeof(s->pcscf));
+        } else if (!strncmp(line, "protocol=", 9)) {
+            strlcpy(s->type, line + 9, sizeof(s->type));
         } else if (!strncmp(line, "mtu=", 4)) {
             s->mtu = atoi(line + 4);
         }
@@ -2309,7 +2311,7 @@ static void requestRegistrationState(int request, void *data __unused,
 
     if (parseRegistrationState(line, &type, &count, &registration)) goto error;
 
-    // On LTE a real modem leaves +CGREG unregistered and reports the bearer in +CEREG
+    // On LTE/5G SA a real modem leaves +CGREG unregistered and reports the bearer in +CEREG or +C5GREG
     if (request == RIL_REQUEST_DATA_REGISTRATION_STATE && registration[0] != 1 &&
             registration[0] != 5 && strcmp(cmd, "AT+CEREG?") != 0) {
         ATResponse *p_eps = NULL;
@@ -2328,6 +2330,24 @@ static void requestRegistrationState(int request, void *data __unused,
         }
         free(eps);
         at_response_free(p_eps);
+    }
+    if (registration[0] != 1 && registration[0] != 5) {
+        ATResponse *p_nr = NULL;
+        int *nr = NULL, nr_type, nr_count = 3;
+        err = at_send_command_singleline("AT+C5GREG?", "+C5GREG:", &p_nr);
+        if (err == 0 && p_nr->success) {
+            char *nr_line = p_nr->p_intermediates->line;
+            if (!parseRegistrationState(nr_line, &nr_type, &nr_count, &nr) &&
+                    (nr[0] == 1 || nr[0] == 5)) {
+                free(registration);
+                registration = nr;
+                nr = NULL;
+                type = nr_type;
+                count = nr_count;
+            }
+        }
+        free(nr);
+        at_response_free(p_nr);
     }
 
     responseStr = malloc(numElements * sizeof(char *));
@@ -6277,8 +6297,10 @@ static void initializeCallback(void *param __unused)
 
     at_response_free(p_response);
 
-    /*  GPRS registration events */
+    /*  GPRS, EPS (LTE), and 5GS (NR SA) registration events */
     at_send_command("AT+CGREG=1", NULL);
+    at_send_command("AT+CEREG=2", NULL);
+    at_send_command("AT+C5GREG=2", NULL);
 
     /*  Call Waiting notifications */
     at_send_command("AT+CCWA=1", NULL);
@@ -6486,6 +6508,8 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
 #endif /* WORKAROUND_FAKE_CGEV */
     } else if (strStartsWith(s,"+CREG:")
                 || strStartsWith(s,"+CGREG:")
+                || strStartsWith(s,"+CEREG:")
+                || strStartsWith(s,"+C5GREG:")
     ) {
         RIL_onUnsolicitedResponse (
             RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,

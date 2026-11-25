@@ -444,6 +444,14 @@ int main(int argc, char **argv) {
     if (!ifname) fail("add link", error);
 
     if (wds4) {
+        g_autoptr(QmiMessageWdsSetIpFamilyInput) fin = qmi_message_wds_set_ip_family_input_new();
+        qmi_message_wds_set_ip_family_input_set_preference(fin, QMI_WDS_IP_FAMILY_IPV4, NULL);
+        qmi_client_wds_set_ip_family(QMI_CLIENT_WDS(wds4), fin, 10, NULL, on_done, &w);
+        g_autoptr(QmiMessageWdsSetIpFamilyOutput) fout =
+                qmi_client_wds_set_ip_family_finish(QMI_CLIENT_WDS(wds4), wait_result(&w), &error);
+        if (!fout || !qmi_message_wds_set_ip_family_output_get_result(fout, &error))
+            g_clear_error(&error);
+
         g_autoptr(QmiMessageWdsBindMuxDataPortInput) in = qmi_message_wds_bind_mux_data_port_input_new();
         qmi_message_wds_bind_mux_data_port_input_set_endpoint_info(in, ep_type, ep_index, NULL);
         qmi_message_wds_bind_mux_data_port_input_set_mux_id(in, mux_id, NULL);
@@ -454,6 +462,14 @@ int main(int argc, char **argv) {
             fail("bind mux data port v4", error);
     }
     if (wds6) {
+        g_autoptr(QmiMessageWdsSetIpFamilyInput) fin = qmi_message_wds_set_ip_family_input_new();
+        qmi_message_wds_set_ip_family_input_set_preference(fin, QMI_WDS_IP_FAMILY_IPV6, NULL);
+        qmi_client_wds_set_ip_family(QMI_CLIENT_WDS(wds6), fin, 10, NULL, on_done, &w);
+        g_autoptr(QmiMessageWdsSetIpFamilyOutput) fout =
+                qmi_client_wds_set_ip_family_finish(QMI_CLIENT_WDS(wds6), wait_result(&w), &error);
+        if (!fout || !qmi_message_wds_set_ip_family_output_get_result(fout, &error))
+            g_clear_error(&error);
+
         g_autoptr(QmiMessageWdsBindMuxDataPortInput) in = qmi_message_wds_bind_mux_data_port_input_new();
         qmi_message_wds_bind_mux_data_port_input_set_endpoint_info(in, ep_type, ep_index, NULL);
         qmi_message_wds_bind_mux_data_port_input_set_mux_id(in, mux_id, NULL);
@@ -464,26 +480,12 @@ int main(int argc, char **argv) {
             fail("bind mux data port v6", error);
     }
 
+    /*
+     * Bring up IPv6 before IPv4 on dual-stack carriers (such as Jio 5G SA / VoLTE):
+     * starting IPv4 first on an IPv6-only/464XLAT bearer can trigger modem CLAT
+     * state that blocks a subsequent IPv6 StartNetwork on the same mux_id.
+     */
     guint32 handle4 = 0, handle6 = 0;
-    if (wds4) {
-        g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
-        if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
-        qmi_message_wds_start_network_input_set_ip_family_preference(in, QMI_WDS_IP_FAMILY_IPV4, NULL);
-        qmi_client_wds_start_network(QMI_CLIENT_WDS(wds4), in, 60, NULL, on_done, &w);
-        g_autoptr(QmiMessageWdsStartNetworkOutput) out =
-                qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds4), wait_result(&w), &error);
-        if (!out || !qmi_message_wds_start_network_output_get_result(out, &error)) {
-            if (!wds6) {
-                QmiWdsCallEndReason reason;
-                if (out && qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
-                    printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
-                fail("start network v4", error);
-            }
-            g_clear_error(&error);
-        } else {
-            qmi_message_wds_start_network_output_get_packet_data_handle(out, &handle4, NULL);
-        }
-    }
     if (wds6) {
         g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
         if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
@@ -492,15 +494,38 @@ int main(int argc, char **argv) {
         g_autoptr(QmiMessageWdsStartNetworkOutput) out =
                 qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds6), wait_result(&w), &error);
         if (!out || !qmi_message_wds_start_network_output_get_result(out, &error)) {
-            if (!handle4) {
+            if (!wds4) {
                 QmiWdsCallEndReason reason;
                 if (out && qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
                     printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
+                qmi_device_delete_link(dev, ifname, mux_id, NULL, on_done, &w);
+                qmi_device_delete_link_finish(dev, wait_result(&w), NULL);
                 fail("start network v6", error);
             }
             g_clear_error(&error);
         } else {
             qmi_message_wds_start_network_output_get_packet_data_handle(out, &handle6, NULL);
+        }
+    }
+    if (wds4) {
+        g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
+        if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
+        qmi_message_wds_start_network_input_set_ip_family_preference(in, QMI_WDS_IP_FAMILY_IPV4, NULL);
+        qmi_client_wds_start_network(QMI_CLIENT_WDS(wds4), in, 60, NULL, on_done, &w);
+        g_autoptr(QmiMessageWdsStartNetworkOutput) out =
+                qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds4), wait_result(&w), &error);
+        if (!out || !qmi_message_wds_start_network_output_get_result(out, &error)) {
+            if (!handle6) {
+                QmiWdsCallEndReason reason;
+                if (out && qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
+                    printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
+                qmi_device_delete_link(dev, ifname, mux_id, NULL, on_done, &w);
+                qmi_device_delete_link_finish(dev, wait_result(&w), NULL);
+                fail("start network v4", error);
+            }
+            g_clear_error(&error);
+        } else {
+            qmi_message_wds_start_network_output_get_packet_data_handle(out, &handle4, NULL);
         }
     }
 
@@ -617,6 +642,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (handle4 && handle6) {
+        printf("protocol=IPV4V6\n");
+    } else if (handle6) {
+        printf("protocol=IPV6\n");
+    } else if (handle4) {
+        printf("protocol=IP\n");
+    }
     if (mtu) {
         printf("mtu=%u\n", mtu);
         set_iface_mtu(ifname, mtu);
