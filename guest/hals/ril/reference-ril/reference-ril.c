@@ -1637,6 +1637,9 @@ static int s_qmiNasResolved = 0;
 static uint32_t s_qmiUimNode = 0;
 static uint32_t s_qmiUimPort = 0;
 static int s_qmiUimResolved = 0;
+static uint32_t s_qmiDmsNode = 0;
+static uint32_t s_qmiDmsPort = 0;
+static int s_qmiDmsResolved = 0;
 static uint16_t s_qmiTxn = 1;
 
 static int qmiLookupService(uint32_t service, uint32_t *out_node, uint32_t *out_port)
@@ -1778,6 +1781,72 @@ static int qmiEnsureUim(void)
         RLOGI("QMI UIM resolved at QRTR node=%u port=%u", s_qmiUimNode, s_qmiUimPort);
     }
     return 0;
+}
+
+static int qmiEnsureDms(void)
+{
+    if (!s_qmiDmsResolved) {
+        if (qmiLookupService(2 /* QMI_SERVICE_DMS */, &s_qmiDmsNode, &s_qmiDmsPort) < 0) {
+            return -1;
+        }
+        s_qmiDmsResolved = 1;
+        RLOGI("QMI DMS resolved at QRTR node=%u port=%u", s_qmiDmsNode, s_qmiDmsPort);
+    }
+    return 0;
+}
+
+static int qmiExtractStringTlv(const uint8_t *buf, size_t len, uint8_t target_tlv,
+                               char *out, size_t out_cap)
+{
+    size_t pos = 7;
+    while (pos + 3 <= len) {
+        uint8_t t = buf[pos];
+        uint16_t l = (uint16_t)(buf[pos + 1] | (buf[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > len) break;
+        if (t == target_tlv && l > 0) {
+            size_t copy = l < out_cap - 1 ? l : out_cap - 1;
+            memcpy(out, buf + pos, copy);
+            out[copy] = '\0';
+            while (copy > 0 && (out[copy - 1] == '\0' || out[copy - 1] == ' ' ||
+                                out[copy - 1] == '\r' || out[copy - 1] == '\n')) {
+                out[--copy] = '\0';
+            }
+            return copy > 0 ? 0 : -1;
+        }
+        pos += l;
+    }
+    return -1;
+}
+
+static int qmiDmsGetBasebandVersion(char *out, size_t out_cap)
+{
+    if (!out || out_cap < 2) return -1;
+    if (qmiEnsureDms() < 0) return -1;
+
+    uint8_t resp[1024];
+    ssize_t n = qmiSendRecv(s_qmiDmsNode, s_qmiDmsPort, 0x0051 /* QMI_DMS_GET_SW_VERSION */,
+                            NULL, 0, resp, sizeof(resp), 2000);
+    if (n > 7 && qmiCheckResultTlv(resp, (size_t)n, NULL) == 0) {
+        /* Prefer TLV 0x11 (full MPSS firmware version string, e.g. MPSS.HI.2.5-...) */
+        if (qmiExtractStringTlv(resp, (size_t)n, 0x11, out, out_cap) == 0) {
+            return 0;
+        }
+        if (qmiExtractStringTlv(resp, (size_t)n, 0x01, out, out_cap) == 0) {
+            return 0;
+        }
+    }
+
+    n = qmiSendRecv(s_qmiDmsNode, s_qmiDmsPort, 0x0023 /* QMI_DMS_GET_DEVICE_REV_ID */,
+                    NULL, 0, resp, sizeof(resp), 2000);
+    if (n > 7 && qmiCheckResultTlv(resp, (size_t)n, NULL) == 0) {
+        if (qmiExtractStringTlv(resp, (size_t)n, 0x01, out, out_cap) == 0) {
+            return 0;
+        }
+    }
+
+    s_qmiDmsResolved = 0;
+    return -1;
 }
 
 static int qmiNasSetModePreference(int raf_bitmap)
@@ -2344,20 +2413,29 @@ error:
 static void requestCdmaBaseBandVersion(int request __unused, void *data __unused,
                                    size_t datalen __unused, RIL_Token t)
 {
-    int err;
-    char * responseStr;
-    ATResponse *p_response = NULL;
-    const char *cmd;
-    const char *prefix;
-    char *line, *p;
-    int commas;
-    int skip;
-    int count = 4;
+    char ver[256];
 
-    // Fixed values. TODO: query modem
-    responseStr = strdup("1.0.0.0");
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, sizeof(responseStr));
-    free(responseStr);
+    if (qmiDmsGetBasebandVersion(ver, sizeof(ver)) == 0) {
+        RLOGI("Baseband version (QMI DMS): %s", ver);
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, ver, strlen(ver) + 1);
+        return;
+    }
+
+    ATResponse *p_response = NULL;
+    int err = at_send_command_multiline("AT+CGMR", "", &p_response);
+    if (err >= 0 && p_response != NULL && p_response->success != 0 &&
+        p_response->p_intermediates != NULL && p_response->p_intermediates->line != NULL) {
+        const char *line = p_response->p_intermediates->line;
+        if (strncmp(line, "+CGMR:", 6) == 0) line += 6;
+        while (*line == ' ') line++;
+        snprintf(ver, sizeof(ver), "%s", line);
+        at_response_free(p_response);
+        RLOGI("Baseband version (AT+CGMR): %s", ver);
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, ver, strlen(ver) + 1);
+        return;
+    }
+    at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
 static void requestDeviceIdentity(int request __unused, void *data __unused,
