@@ -6,10 +6,6 @@
 cc_binary {
     name: "kona-dataconn",
     vendor: true,
-    defaults: [
-        "libqmi_glib_dep_defaults",
-        "libqmi_libqmi_glib_dep_defaults",
-    ],
     srcs: ["dataconn.c"],
     cflags: [
         "-DHAVE_CONFIG_H",
@@ -19,10 +15,13 @@ cc_binary {
     header_libs: [
         "libqmi_config_header",
         "libqmi_top_headers",
+        "libqmi_libqmi_glib_headers",
     ],
     shared_libs: [
         "libgio-2.0",
+        "libglib-2.0",
         "libgobject-2.0",
+        "libqmi-glib",
         "libqrtr-glib",
     ],
 }
