@@ -695,6 +695,9 @@ static void onSIMReady()
     at_send_command("AT+CNMI=1,2,2,1,1", NULL);
 }
 
+static int useDataconn(void);
+static void stopDataconn(int cid);
+
 static void requestRadioPower(void *data, size_t datalen __unused, RIL_Token t)
 {
     int onOff;
@@ -706,19 +709,23 @@ static void requestRadioPower(void *data, size_t datalen __unused, RIL_Token t)
     onOff = ((int *)data)[0];
 
     if (onOff == 0 && sState != RADIO_STATE_OFF) {
+        if (useDataconn()) {
+            stopDataconn(0);
+        }
         err = at_send_command("AT+CFUN=0", &p_response);
         if (err < 0 || p_response->success == 0) goto error;
         setRadioState(RADIO_STATE_OFF);
     } else if (onOff > 0 && sState == RADIO_STATE_OFF) {
-        err = at_send_command("AT+CFUN=1", &p_response);
-        if (err < 0|| p_response->success == 0) {
-            // Some stacks return an error when there is no SIM,
-            // but they really turn the RF portion on
-            // So, if we get an error, let's check to see if it
-            // turned on anyway
-
-            if (isRadioOn() != 1) {
-                goto error;
+        if (isRadioOn() != 1) {
+            err = at_send_command("AT+CFUN=1", &p_response);
+            if (err < 0 || p_response->success == 0) {
+                // Some stacks return an error when there is no SIM,
+                // but they really turn the RF portion on
+                // So, if we get an error, let's check to see if it
+                // turned on anyway
+                if (isRadioOn() != 1) {
+                    goto error;
+                }
             }
         }
         setRadioState(RADIO_STATE_ON);
@@ -6480,8 +6487,10 @@ static void initializeCallback(void *param __unused)
     ATResponse *p_response = NULL;
     int err;
 
-    setRadioState (RADIO_STATE_OFF);
-
+    /*
+     * Keep sState UNAVAILABLE until AT handshake and URC setup complete so
+     * com.android.phone does not race RADIO_POWER (AT+CFUN=1) with init.
+     */
     at_handshake();
 
     probeForModemMode(sMdmInfo);
@@ -6553,6 +6562,8 @@ static void initializeCallback(void *param __unused)
     /* assume radio is off on error */
     if (isRadioOn() > 0) {
         setRadioState (RADIO_STATE_ON);
+    } else {
+        setRadioState (RADIO_STATE_OFF);
     }
 
     if (!s_signalPollStarted) {
