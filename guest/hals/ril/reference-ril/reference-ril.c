@@ -1849,6 +1849,37 @@ static int qmiDmsGetBasebandVersion(char *out, size_t out_cap)
     return -1;
 }
 
+static int qmiDmsGetSerialNumbers(char *imei, size_t imei_cap,
+                                  char *imeisv, size_t imeisv_cap,
+                                  char *esn, size_t esn_cap,
+                                  char *meid, size_t meid_cap)
+{
+    if (imei && imei_cap) imei[0] = '\0';
+    if (imeisv && imeisv_cap) imeisv[0] = '\0';
+    if (esn && esn_cap) esn[0] = '\0';
+    if (meid && meid_cap) meid[0] = '\0';
+
+    if (qmiEnsureDms() < 0) return -1;
+
+    uint8_t resp[512];
+    ssize_t n = qmiSendRecv(s_qmiDmsNode, s_qmiDmsPort,
+                            0x0025 /* QMI_DMS_GET_DEVICE_SERIAL_NUMBERS */,
+                            NULL, 0, resp, sizeof(resp), 2000);
+    if (n <= 7 || qmiCheckResultTlv(resp, (size_t)n, NULL) < 0) {
+        s_qmiDmsResolved = 0;
+        return -1;
+    }
+
+    if (imei && imei_cap) qmiExtractStringTlv(resp, (size_t)n, 0x11, imei, imei_cap);
+    if (imeisv && imeisv_cap) qmiExtractStringTlv(resp, (size_t)n, 0x13, imeisv, imeisv_cap);
+    if (esn && esn_cap) {
+        qmiExtractStringTlv(resp, (size_t)n, 0x10, esn, esn_cap);
+        if (strcmp(esn, "0") == 0) esn[0] = '\0';
+    }
+    if (meid && meid_cap) qmiExtractStringTlv(resp, (size_t)n, 0x12, meid, meid_cap);
+    return (imei && imei[0] != '\0') ? 0 : -1;
+}
+
 static int qmiNasSetModePreference(int raf_bitmap)
 {
     if (qmiEnsureNas() < 0) return -1;
@@ -2441,36 +2472,32 @@ static void requestCdmaBaseBandVersion(int request __unused, void *data __unused
 static void requestDeviceIdentity(int request __unused, void *data __unused,
                                         size_t datalen __unused, RIL_Token t)
 {
-    int err;
-    int response[4];
-    char * responseStr[4];
+    char imei[32] = {0};
+    char imeisv[16] = {0};
+    char esn[32] = {0};
+    char meid[32] = {0};
+    char *responseStr[4];
     ATResponse *p_response = NULL;
-    const char *cmd;
-    const char *prefix;
-    char *line, *p;
-    int commas;
-    int skip;
-    int count = 4;
-    char meid[14] = {0};
 
-    err = at_send_command_numeric("AT+CGSN", &p_response);
-    if (err < 0 || p_response->success == 0) {
-        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-        return;
+    if (qmiDmsGetSerialNumbers(imei, sizeof(imei), imeisv, sizeof(imeisv),
+                               esn, sizeof(esn), meid, sizeof(meid)) < 0) {
+        int err = at_send_command_numeric("AT+CGSN", &p_response);
+        if (err < 0 || p_response == NULL || p_response->success == 0 ||
+            p_response->p_intermediates == NULL) {
+            at_response_free(p_response);
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            return;
+        }
+        snprintf(imei, sizeof(imei), "%s", p_response->p_intermediates->line);
+        at_response_free(p_response);
     }
 
-    responseStr[0] = p_response->p_intermediates->line;
-    responseStr[1] = "";
-    responseStr[2] = "77777777";
-    responseStr[3] = "";  // default empty for non-CDMA
+    responseStr[0] = imei;
+    responseStr[1] = imeisv;
+    responseStr[2] = esn;
+    responseStr[3] = meid;
 
-    if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
-        strncpy(meid, responseStr[0], sizeof(meid));
-        responseStr[3] = meid;
-    }
-
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
-    at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, 4 * sizeof(char *));
 }
 
 static void requestCdmaGetSubscriptionSource(int request __unused, void *data,
