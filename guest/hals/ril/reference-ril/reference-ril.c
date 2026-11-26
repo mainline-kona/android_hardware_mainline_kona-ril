@@ -2103,42 +2103,112 @@ static int qmiUimGetSlotsStatus(QmiUimSlotInfo *slots, int max_slots)
     return -1;
 }
 
+static uint16_t s_lastModePref = 0;
+
 static int qmiNasSetModePreference(int raf_bitmap)
 {
     if (qmiEnsureNas() < 0) return -1;
 
     uint16_t mode_pref = 0;
-    if (raf_bitmap & CDMA) mode_pref |= (1u << 0);
-    if (raf_bitmap & EVDO) mode_pref |= (1u << 1);
-    if (raf_bitmap & GSM) mode_pref |= (1u << 2);
-    if (raf_bitmap & WCDMA) mode_pref |= (1u << 3);
-    if (raf_bitmap & (LTE | RAF_LTE_CA)) mode_pref |= (1u << 4);
-    if (raf_bitmap & RAF_TD_SCDMA) mode_pref |= (1u << 5);
-    if (raf_bitmap & NR) mode_pref |= (1u << 6);
+    uint8_t acq[8];
+    uint8_t acq_len = 0;
+    if (raf_bitmap & NR) {
+        mode_pref |= (1u << 6);
+        acq[acq_len++] = 0x0C; /* QMI_NAS_RADIO_INTERFACE_5GNR */
+    }
+    if (raf_bitmap & (LTE | RAF_LTE_CA)) {
+        mode_pref |= (1u << 4);
+        acq[acq_len++] = 0x08; /* QMI_NAS_RADIO_INTERFACE_LTE */
+    }
+    if (raf_bitmap & WCDMA) {
+        mode_pref |= (1u << 3);
+        acq[acq_len++] = 0x05; /* QMI_NAS_RADIO_INTERFACE_UMTS */
+    }
+    if (raf_bitmap & RAF_TD_SCDMA) {
+        mode_pref |= (1u << 5);
+        acq[acq_len++] = 0x09; /* QMI_NAS_RADIO_INTERFACE_TD_SCDMA */
+    }
+    if (raf_bitmap & GSM) {
+        mode_pref |= (1u << 2);
+        acq[acq_len++] = 0x04; /* QMI_NAS_RADIO_INTERFACE_GSM */
+    }
+    if (raf_bitmap & EVDO) {
+        mode_pref |= (1u << 1);
+        acq[acq_len++] = 0x02; /* QMI_NAS_RADIO_INTERFACE_CDMA_1XEVDO */
+    }
+    if (raf_bitmap & CDMA) {
+        mode_pref |= (1u << 0);
+        acq[acq_len++] = 0x01; /* QMI_NAS_RADIO_INTERFACE_CDMA_1X */
+    }
 
     if (mode_pref == 0) {
         RLOGW("qmiNasSetModePreference: empty mode_pref for bitmap 0x%x, ignoring", raf_bitmap);
         return -1;
     }
 
-    uint8_t tlvs[] = {
-        0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
-        0x17, 0x01, 0x00, 0x01, /* QMI_NAS_CHANGE_DURATION_PERMANENT */
-    };
+    uint16_t prev_mode = s_lastModePref;
+    uint8_t tlvs[64];
+    size_t off = 0;
+    /* TLV 0x11: Mode Preference */
+    tlvs[off++] = 0x11; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(mode_pref & 0xff);
+    tlvs[off++] = (uint8_t)((mode_pref >> 8) & 0xff);
+    /* TLV 0x16: Network Selection Preference = AUTOMATIC (0) to trigger reselection */
+    tlvs[off++] = 0x16; tlvs[off++] = 0x05; tlvs[off++] = 0x00;
+    tlvs[off++] = 0x00; tlvs[off++] = 0x00; tlvs[off++] = 0x00;
+    tlvs[off++] = 0x00; tlvs[off++] = 0x00;
+    /* TLV 0x17: Change Duration = PERMANENT (1) */
+    tlvs[off++] = 0x17; tlvs[off++] = 0x01; tlvs[off++] = 0x00;
+    tlvs[off++] = 0x01;
+    /* TLV 0x1E: Acquisition Order Preference (highest RAT first: NR5G -> LTE -> UMTS -> GSM) */
+    if (acq_len > 0) {
+        uint16_t tlen = (uint16_t)(1 + acq_len);
+        tlvs[off++] = 0x1E;
+        tlvs[off++] = (uint8_t)(tlen & 0xff);
+        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
+        tlvs[off++] = acq_len;
+        memcpy(tlvs + off, acq, acq_len);
+        off += acq_len;
+    }
+
     uint8_t resp[256];
     ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033 /* SetSystemSelectionPreference */,
-                            tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
-    if (n < 0) {
-        s_qmiNasResolved = 0;
-        return -1;
-    }
+                            tlvs, off, resp, sizeof(resp), 2000);
     uint16_t qerr = 0;
-    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
-        RLOGW("QMI NAS SetSystemSelectionPreference(0x%04x) QMI err=0x%04x", mode_pref, qerr);
-        return -1;
+    if (n < 0 || qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+        /* Fallback to minimal Mode Preference + Permanent TLVs if extended TLVs were rejected */
+        uint8_t min_tlvs[] = {
+            0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
+            0x17, 0x01, 0x00, 0x01,
+        };
+        n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033,
+                        min_tlvs, sizeof(min_tlvs), resp, sizeof(resp), 2000);
+        if (n < 0) {
+            s_qmiNasResolved = 0;
+            return -1;
+        }
+        if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+            RLOGW("QMI NAS SetSystemSelectionPreference(0x%04x) QMI err=0x%04x", mode_pref, qerr);
+            return -1;
+        }
     }
+
+    s_lastModePref = mode_pref;
     RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> mode_pref=0x%04x OK",
           raf_bitmap, mode_pref);
+
+    /*
+     * When upgrading from LTE-only to 5G+LTE, SDX55 keeps its existing LTE
+     * attach because LTE is still permitted in mode_pref. Kick automatic
+     * PLMN/RAT reselection via AT+COPS=0 so it re-acquires 5G NR immediately
+     * without requiring an Airplane Mode toggle.
+     */
+    if ((mode_pref & (1u << 6)) && prev_mode != 0 && !(prev_mode & (1u << 6)) &&
+            sState == RADIO_STATE_ON) {
+        at_send_command("AT+COPS=0", NULL);
+        static const struct timeval settle_3s = {3, 500000};
+        RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &settle_3s);
+    }
     return 0;
 }
 
