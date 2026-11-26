@@ -5650,6 +5650,7 @@ onRequestSlot2(int request, void *data, size_t datalen, RIL_Token t)
             case RIL_REQUEST_GET_RADIO_CAPABILITY:
             case RIL_REQUEST_GET_MODEM_STACK_STATUS:
             case RIL_REQUEST_ENABLE_MODEM:
+            case RIL_REQUEST_ALLOW_DATA:
             case RIL_REQUEST_CONFIG_GET_SLOT_STATUS:
             case RIL_REQUEST_CONFIG_SET_SLOT_MAPPING:
             case RIL_REQUEST_CONFIG_GET_PHONE_CAPABILITY:
@@ -5985,11 +5986,12 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
     RLOGD("onRequest: %s, sState: %d", requestToString(request), sState);
 
-    /* Ignore all requests except RIL_REQUEST_GET_SIM_STATUS
+    /* Ignore all requests except RIL_REQUEST_GET_SIM_STATUS and ALLOW_DATA
      * when RADIO_STATE_UNAVAILABLE.
      */
     if (sState == RADIO_STATE_UNAVAILABLE
         && request != RIL_REQUEST_GET_SIM_STATUS
+        && request != RIL_REQUEST_ALLOW_DATA
     ) {
         RIL_onRequestComplete(t, RIL_E_RADIO_NOT_AVAILABLE, NULL, 0);
         return;
@@ -6000,6 +6002,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
      */
     if (sState == RADIO_STATE_OFF) {
         switch(request) {
+            case RIL_REQUEST_ALLOW_DATA:
             case RIL_REQUEST_BASEBAND_VERSION:
             case RIL_REQUEST_CDMA_GET_SUBSCRIPTION_SOURCE:
             case RIL_REQUEST_CDMA_QUERY_PREFERRED_VOICE_PRIVACY_MODE:
