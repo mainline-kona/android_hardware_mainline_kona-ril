@@ -2109,6 +2109,82 @@ static int qmiUimGetSlotsStatus(QmiUimSlotInfo *slots, int max_slots)
 }
 
 static uint16_t s_lastModePref = 0;
+static int s_nrNudgeActive = 0;
+static uint16_t s_pendingModePref = 0;
+static uint8_t s_pendingAcq[8];
+static uint8_t s_pendingAcqLen = 0;
+static uintptr_t s_pendingModeGen = 0;
+
+static int qmiNasSendSysSelPref(uint16_t mode_pref, const uint8_t *acq, uint8_t acq_len,
+                                uint8_t duration)
+{
+    uint8_t tlvs[64];
+    size_t off = 0;
+    /* TLV 0x11: Mode Preference */
+    tlvs[off++] = 0x11; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(mode_pref & 0xff);
+    tlvs[off++] = (uint8_t)((mode_pref >> 8) & 0xff);
+    /* TLV 0x16: Network Selection Preference = AUTOMATIC (0) */
+    tlvs[off++] = 0x16; tlvs[off++] = 0x05; tlvs[off++] = 0x00;
+    tlvs[off++] = 0x00; tlvs[off++] = 0x00; tlvs[off++] = 0x00;
+    tlvs[off++] = 0x00; tlvs[off++] = 0x00;
+    /* TLV 0x17: Change Duration (0 = POWER_CYCLE, 1 = PERMANENT) */
+    tlvs[off++] = 0x17; tlvs[off++] = 0x01; tlvs[off++] = 0x00;
+    tlvs[off++] = duration;
+    /* TLV 0x1E: Acquisition Order Preference (highest RAT first: NR5G -> LTE -> UMTS -> GSM) */
+    if (acq && acq_len > 0) {
+        uint16_t tlen = (uint16_t)(1 + acq_len);
+        tlvs[off++] = 0x1E;
+        tlvs[off++] = (uint8_t)(tlen & 0xff);
+        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
+        tlvs[off++] = acq_len;
+        memcpy(tlvs + off, acq, acq_len);
+        off += acq_len;
+    }
+
+    uint8_t resp[256];
+    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033 /* SetSystemSelectionPreference */,
+                            tlvs, off, resp, sizeof(resp), 2000);
+    uint16_t qerr = 0;
+    if (n < 0 || qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+        /* Fallback to minimal Mode Preference + Change Duration TLVs if extended TLVs were rejected */
+        uint8_t min_tlvs[] = {
+            0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
+            0x17, 0x01, 0x00, duration,
+        };
+        n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033,
+                        min_tlvs, sizeof(min_tlvs), resp, sizeof(resp), 2000);
+        if (n < 0) {
+            s_qmiNasResolved = 0;
+            return -1;
+        }
+        if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+            RLOGW("QMI NAS SetSystemSelectionPreference(0x%04x) QMI err=0x%04x", mode_pref, qerr);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void restorePendingModePrefCallback(void *param)
+{
+    uintptr_t gen = (uintptr_t)param;
+    if (!s_nrNudgeActive || gen != s_pendingModeGen) {
+        return;
+    }
+    s_nrNudgeActive = 0;
+
+    if (sState != RADIO_STATE_ON || qmiEnsureNas() < 0) {
+        return;
+    }
+
+    if (qmiNasSendSysSelPref(s_pendingModePref, s_pendingAcq, s_pendingAcqLen, 0x01) == 0) {
+        s_lastModePref = s_pendingModePref;
+        RLOGI("QMI NAS NR-nudge complete -> restored permanent mode_pref=0x%04x",
+              s_pendingModePref);
+    }
+    notifyNetworkAndSignal(NULL);
+}
 
 static int qmiNasSetModePreference(int raf_bitmap)
 {
@@ -2151,69 +2227,56 @@ static int qmiNasSetModePreference(int raf_bitmap)
         return -1;
     }
 
-    uint16_t prev_mode = s_lastModePref;
-    uint8_t tlvs[64];
-    size_t off = 0;
-    /* TLV 0x11: Mode Preference */
-    tlvs[off++] = 0x11; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
-    tlvs[off++] = (uint8_t)(mode_pref & 0xff);
-    tlvs[off++] = (uint8_t)((mode_pref >> 8) & 0xff);
-    /* TLV 0x16: Network Selection Preference = AUTOMATIC (0) to trigger reselection */
-    tlvs[off++] = 0x16; tlvs[off++] = 0x05; tlvs[off++] = 0x00;
-    tlvs[off++] = 0x00; tlvs[off++] = 0x00; tlvs[off++] = 0x00;
-    tlvs[off++] = 0x00; tlvs[off++] = 0x00;
-    /* TLV 0x17: Change Duration = PERMANENT (1) */
-    tlvs[off++] = 0x17; tlvs[off++] = 0x01; tlvs[off++] = 0x00;
-    tlvs[off++] = 0x01;
-    /* TLV 0x1E: Acquisition Order Preference (highest RAT first: NR5G -> LTE -> UMTS -> GSM) */
-    if (acq_len > 0) {
-        uint16_t tlen = (uint16_t)(1 + acq_len);
-        tlvs[off++] = 0x1E;
-        tlvs[off++] = (uint8_t)(tlen & 0xff);
-        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
-        tlvs[off++] = acq_len;
-        memcpy(tlvs + off, acq, acq_len);
-        off += acq_len;
+    /*
+     * Telephony frequently sends duplicate SET_ALLOWED_NETWORK_TYPES_BITMAP
+     * requests ~30-50ms apart; don't abort an in-flight NR-only nudge for the
+     * exact same target mode_pref.
+     */
+    if (s_nrNudgeActive && mode_pref == s_pendingModePref) {
+        RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> NR-nudge already in flight for 0x%04x",
+              raf_bitmap, mode_pref);
+        return 0;
     }
 
-    uint8_t resp[256];
-    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033 /* SetSystemSelectionPreference */,
-                            tlvs, off, resp, sizeof(resp), 2000);
-    uint16_t qerr = 0;
-    if (n < 0 || qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
-        /* Fallback to minimal Mode Preference + Permanent TLVs if extended TLVs were rejected */
-        uint8_t min_tlvs[] = {
-            0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
-            0x17, 0x01, 0x00, 0x01,
-        };
-        n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033,
-                        min_tlvs, sizeof(min_tlvs), resp, sizeof(resp), 2000);
-        if (n < 0) {
-            s_qmiNasResolved = 0;
-            return -1;
+    uint16_t prev_mode = s_lastModePref;
+    s_nrNudgeActive = 0;
+    s_pendingModeGen++;
+
+    /*
+     * When upgrading from LTE/non-NR to 5G+LTE, SDX55 stays camped on LTE
+     * (and treats AT+COPS=0 as a no-op when already registered automatically).
+     * Briefly apply a temporary (POWER_CYCLE) NR-only mode_pref (0x0040) so
+     * the modem immediately hands over to 5G NR SA (~1s, keeping IMS up),
+     * then restore the full permanent NR+LTE preference after 2.5s so normal
+     * 4G fallback remains available if NR signal is absent or lost.
+     */
+    if ((mode_pref & (1u << 6)) && (mode_pref != (1u << 6)) &&
+            prev_mode != 0 && !(prev_mode & (1u << 6)) &&
+            sState == RADIO_STATE_ON) {
+        static const uint8_t nr_only_acq[] = { 0x0C };
+        if (qmiNasSendSysSelPref((uint16_t)(1u << 6), nr_only_acq, 1, 0x00) == 0) {
+            s_lastModePref = mode_pref;
+            s_pendingModePref = mode_pref;
+            memcpy(s_pendingAcq, acq, acq_len);
+            s_pendingAcqLen = acq_len;
+            s_nrNudgeActive = 1;
+            uintptr_t gen = s_pendingModeGen;
+            static const struct timeval nudge_delay = {2, 500000};
+            RIL_requestTimedCallback(restorePendingModePrefCallback, (void *)gen, &nudge_delay);
+            RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> NR-only nudge (0x0040), restoring 0x%04x in 2.5s",
+                  raf_bitmap, mode_pref);
+            return 0;
         }
-        if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
-            RLOGW("QMI NAS SetSystemSelectionPreference(0x%04x) QMI err=0x%04x", mode_pref, qerr);
-            return -1;
-        }
+        /* If temporary NR-only nudge failed, fall through to normal permanent set. */
+    }
+
+    if (qmiNasSendSysSelPref(mode_pref, acq, acq_len, 0x01) < 0) {
+        return -1;
     }
 
     s_lastModePref = mode_pref;
     RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> mode_pref=0x%04x OK",
           raf_bitmap, mode_pref);
-
-    /*
-     * When upgrading from LTE-only to 5G+LTE, SDX55 keeps its existing LTE
-     * attach because LTE is still permitted in mode_pref. Kick automatic
-     * PLMN/RAT reselection via AT+COPS=0 so it re-acquires 5G NR immediately
-     * without requiring an Airplane Mode toggle.
-     */
-    if ((mode_pref & (1u << 6)) && prev_mode != 0 && !(prev_mode & (1u << 6)) &&
-            sState == RADIO_STATE_ON) {
-        at_send_command("AT+COPS=0", NULL);
-        static const struct timeval settle_3s = {3, 500000};
-        RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &settle_3s);
-    }
     return 0;
 }
 
