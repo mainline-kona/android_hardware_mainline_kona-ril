@@ -1731,6 +1731,7 @@ static int s_qmiNasResolved = 0;
 static uint32_t s_qmiUimNode = 0;
 static uint32_t s_qmiUimPort = 0;
 static int s_qmiUimResolved = 0;
+static int s_qmiUimFd = -1;
 static uint32_t s_qmiDmsNode = 0;
 static uint32_t s_qmiDmsPort = 0;
 static int s_qmiDmsResolved = 0;
@@ -1823,11 +1824,19 @@ static ssize_t qmiSendRecvFd(int fd, uint32_t node, uint32_t port, uint16_t msg_
         return -1;
     }
 
-    ssize_t n = recv(fd, resp, resp_cap, 0);
-    if (n < 7) return -1;
-    uint16_t rmsg = (uint16_t)(resp[3] | (resp[4] << 8));
-    if (rmsg != msg_id) return -1;
-    return n;
+    for (int tries = 0; tries < 8; tries++) {
+        ssize_t n = recv(fd, resp, resp_cap, 0);
+        if (n < 7) return -1;
+        uint8_t flags = resp[0];
+        uint16_t rtxn = (uint16_t)(resp[1] | (resp[2] << 8));
+        uint16_t rmsg = (uint16_t)(resp[3] | (resp[4] << 8));
+        /* Skip unsolicited indications or stale responses on persistent QRTR sockets */
+        if (flags != 0x02 || rmsg != msg_id || rtxn != txn) {
+            continue;
+        }
+        return n;
+    }
+    return -1;
 }
 
 static ssize_t qmiSendRecv(uint32_t node, uint32_t port, uint16_t msg_id,
@@ -1875,6 +1884,15 @@ static int qmiEnsureNas(void)
     return 0;
 }
 
+static void qmiResetUim(void)
+{
+    if (s_qmiUimFd >= 0) {
+        close(s_qmiUimFd);
+        s_qmiUimFd = -1;
+    }
+    s_qmiUimResolved = 0;
+}
+
 static int qmiEnsureUim(void)
 {
     if (!s_qmiUimResolved) {
@@ -1884,7 +1902,25 @@ static int qmiEnsureUim(void)
         s_qmiUimResolved = 1;
         RLOGI("QMI UIM resolved at QRTR node=%u port=%u", s_qmiUimNode, s_qmiUimPort);
     }
+    if (s_qmiUimFd < 0) {
+        s_qmiUimFd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s_qmiUimFd < 0) {
+            return -1;
+        }
+    }
     return 0;
+}
+
+static ssize_t qmiUimSendRecv(uint16_t msg_id, const uint8_t *tlvs, size_t tlv_len,
+                              uint8_t *resp, size_t resp_cap, int timeout_ms)
+{
+    if (qmiEnsureUim() < 0) return -1;
+    ssize_t n = qmiSendRecvFd(s_qmiUimFd, s_qmiUimNode, s_qmiUimPort,
+                              msg_id, tlvs, tlv_len, resp, resp_cap, timeout_ms);
+    if (n < 0) {
+        qmiResetUim();
+    }
+    return n;
 }
 
 static int qmiEnsureDms(void)
@@ -2280,12 +2316,30 @@ static int qmiNasSetModePreference(int raf_bitmap)
     return 0;
 }
 
+static int qmiUimCloseLogicalChannel(uint8_t ch)
+{
+    uint8_t tlvs[] = {
+        0x01, 0x01, 0x00, 0x01, /* Slot = 1 */
+        0x11, 0x01, 0x00, ch,   /* Channel ID to close */
+    };
+    uint8_t resp[256];
+    ssize_t n = qmiUimSendRecv(0x003F /* LogicalChannel */,
+                               tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
+    if (n < 0) {
+        return -1;
+    }
+    uint16_t qerr = 0;
+    int rc = qmiCheckResultTlv(resp, (size_t)n, &qerr);
+    if (rc < 0) {
+        RLOGW("QMI UIM CloseLogicalChannel(ch=%u) failed err=0x%04x", ch, qerr);
+    }
+    return rc;
+}
+
 static int qmiUimOpenLogicalChannel(const uint8_t *aid, size_t aid_len, int p2,
                                     uint8_t *out_ch, uint8_t *out_sel, size_t *out_sel_len,
                                     uint8_t *out_sw1, uint8_t *out_sw2)
 {
-    if (qmiEnsureUim() < 0) return -1;
-
     uint8_t tlvs[128];
     size_t off = 0;
     /* TLV 0x01: Slot = 1 */
@@ -2310,15 +2364,26 @@ static int qmiUimOpenLogicalChannel(const uint8_t *aid, size_t aid_len, int p2,
     }
 
     uint8_t resp[512];
-    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x0042 /* OpenLogicalChannel */,
-                            tlvs, off, resp, sizeof(resp), 2000);
-    if (n < 0) {
-        s_qmiUimResolved = 0;
-        return -1;
-    }
+    ssize_t n = -1;
     uint16_t qerr = 0;
-    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
-        RLOGW("QMI UIM OpenLogicalChannel failed err=0x%04x", qerr);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        n = qmiUimSendRecv(0x0042 /* OpenLogicalChannel */,
+                           tlvs, off, resp, sizeof(resp), 2000);
+        if (n < 0) return -1;
+        qerr = 0;
+        if (qmiCheckResultTlv(resp, (size_t)n, &qerr) == 0) {
+            break;
+        }
+        RLOGW("QMI UIM OpenLogicalChannel failed err=0x%04x (attempt=%d)", qerr, attempt);
+        if (attempt == 0 && qerr == 0x0044 /* INSUFFICIENT_RESOURCES */) {
+            /* Reclaim any leaked logical channels on the SIM and recycle QRTR client */
+            for (uint8_t c = 1; c <= 4; c++) {
+                qmiUimCloseLogicalChannel(c);
+            }
+            qmiResetUim();
+            usleep(50000);
+            continue;
+        }
         return -1;
     }
 
@@ -2351,28 +2416,10 @@ static int qmiUimOpenLogicalChannel(const uint8_t *aid, size_t aid_len, int p2,
     return got_ch ? 0 : -1;
 }
 
-static int qmiUimCloseLogicalChannel(uint8_t ch)
-{
-    if (qmiEnsureUim() < 0) return -1;
-    uint8_t tlvs[] = {
-        0x01, 0x01, 0x00, 0x01, /* Slot = 1 */
-        0x11, 0x01, 0x00, ch,   /* Channel ID to close */
-    };
-    uint8_t resp[256];
-    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x003F /* LogicalChannel */,
-                            tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
-    if (n < 0) {
-        s_qmiUimResolved = 0;
-        return -1;
-    }
-    uint16_t qerr = 0;
-    return qmiCheckResultTlv(resp, (size_t)n, &qerr);
-}
-
 static int qmiUimSendApdu(uint8_t ch, const uint8_t *apdu, size_t apdu_len,
                           uint8_t *out_resp, size_t resp_cap, size_t *out_resp_len)
 {
-    if (qmiEnsureUim() < 0 || !apdu || apdu_len == 0 || apdu_len > 512) return -1;
+    if (!apdu || apdu_len == 0 || apdu_len > 512) return -1;
 
     uint8_t tlvs[600];
     size_t off = 0;
@@ -2391,10 +2438,9 @@ static int qmiUimSendApdu(uint8_t ch, const uint8_t *apdu, size_t apdu_len,
     tlvs[off++] = 0x10; tlvs[off++] = 0x01; tlvs[off++] = 0x00; tlvs[off++] = ch;
 
     uint8_t resp[1024];
-    ssize_t n = qmiSendRecv(s_qmiUimNode, s_qmiUimPort, 0x003B /* SendAPDU */,
-                            tlvs, off, resp, sizeof(resp), 3000);
+    ssize_t n = qmiUimSendRecv(0x003B /* SendAPDU */,
+                               tlvs, off, resp, sizeof(resp), 3000);
     if (n < 0) {
-        s_qmiUimResolved = 0;
         return -1;
     }
     uint16_t qerr = 0;
