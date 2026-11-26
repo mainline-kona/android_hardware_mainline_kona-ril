@@ -372,6 +372,7 @@ static const struct timeval TIMEVAL_RAT_SETTLE = {1, 500000};
 static int s_lastRegTech = RADIO_TECH_UNKNOWN;
 static int s_lastRegAct = -1;
 static int s_lastSignalValid = 0;
+static int s_copsDeregistered = 0;
 static int s_lastSignal[sizeof(RIL_SignalStrength_v12) / sizeof(int)];
 
 static void pushSignalStrengthOnce(void *param __unused);
@@ -750,6 +751,10 @@ static void onRadioPowerOn()
 static void onSIMReady()
 {
     enableNetworkRegistrationUrks();
+    if (areUiccApplicationsEnabled && s_copsDeregistered) {
+        s_copsDeregistered = 0;
+        at_send_command("AT+COPS=0", NULL);
+    }
     at_send_command_singleline("AT+CSMS=1", "+CSMS:", NULL);
     /*
      * Always send SMS messages directly to the TE
@@ -3227,6 +3232,38 @@ static void requestRegistrationState(int request, void *data __unused,
     } else {
         assert(0);
         goto error;
+    }
+
+    // If UICC applications are disabled ("Use this SIM" toggled OFF), report
+    // unregistered immediately so Android drops service without waiting on AT+COPS=2.
+    if (!areUiccApplicationsEnabled) {
+        s_lastRegTech = RADIO_TECH_UNKNOWN;
+        s_lastRegAct = -1;
+        responseStr = calloc(numElements, sizeof(char *));
+        if (!responseStr) goto error;
+        asprintf(&responseStr[0], "0");
+        if (request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
+            asprintf(&responseStr[11], "%d", s_mcc);
+            asprintf(&responseStr[12], "%d", s_mnc);
+            if (s_mncLength == 2) {
+                asprintf(&responseStr[13], "%03d%02d", s_mcc, s_mnc);
+            } else {
+                asprintf(&responseStr[13], "%03d%03d", s_mcc, s_mnc);
+            }
+            asprintf(&responseStr[14], "0");
+        } else {
+            asprintf(&responseStr[15], "%d", s_mcc);
+            asprintf(&responseStr[16], "%d", s_mnc);
+            if (s_mncLength == 2) {
+                asprintf(&responseStr[17], "%03d%02d", s_mcc, s_mnc);
+            } else {
+                asprintf(&responseStr[17], "%03d%03d", s_mcc, s_mnc);
+            }
+        }
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, numElements * sizeof(responseStr));
+        for (j = 0; j < numElements; j++) free(responseStr[j]);
+        free(responseStr);
+        return;
     }
 
     // Self-heal if SDX55 ever reverted +C*REG URC mode <n> back to 0 (no TAC/NCI/AcT or URCs).
@@ -6256,6 +6293,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
     if (sState == RADIO_STATE_OFF) {
         switch(request) {
             case RIL_REQUEST_ALLOW_DATA:
+            case RIL_REQUEST_ARE_UICC_APPLICATIONS_ENABLED:
             case RIL_REQUEST_BASEBAND_VERSION:
             case RIL_REQUEST_CDMA_GET_SUBSCRIPTION_SOURCE:
             case RIL_REQUEST_CDMA_QUERY_PREFERRED_VOICE_PRIVACY_MODE:
@@ -6264,6 +6302,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             case RIL_REQUEST_CDMA_SET_SUBSCRIPTION_SOURCE:
             case RIL_REQUEST_CDMA_SUBSCRIPTION:
             case RIL_REQUEST_DEVICE_IDENTITY:
+            case RIL_REQUEST_ENABLE_UICC_APPLICATIONS:
             case RIL_REQUEST_EXIT_EMERGENCY_CALLBACK_MODE:
             case RIL_REQUEST_GET_ACTIVITY_INFO:
             case RIL_REQUEST_GET_CARRIER_RESTRICTIONS:
@@ -6284,6 +6323,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             case RIL_REQUEST_SET_CARRIER_RESTRICTIONS:
             case RIL_REQUEST_SET_LOCATION_UPDATES:
             case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE:
+            case RIL_REQUEST_SET_SIM_CARD_POWER:
             case RIL_REQUEST_SET_TTY_MODE:
             case RIL_REQUEST_SET_UNSOL_CELL_INFO_LIST_RATE:
             case RIL_REQUEST_STOP_LCE:
@@ -6947,8 +6987,40 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 RIL_onRequestComplete(t, RIL_E_INTERNAL_ERR, NULL, 0);
                 break;
             }
-            areUiccApplicationsEnabled = *(int *)(data);
+            bool newEnabled = (*(int *)(data) != 0);
+            bool changed = (newEnabled != areUiccApplicationsEnabled);
+            areUiccApplicationsEnabled = newEnabled;
+            RLOGI("ENABLE_UICC_APPLICATIONS: enable=%d (changed=%d, sState=%d)",
+                  areUiccApplicationsEnabled ? 1 : 0, changed ? 1 : 0, sState);
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+
+            if (!areUiccApplicationsEnabled) {
+                if (useDataconn()) {
+                    stopDataconn(0);
+                    sendDataconnCallList(NULL);
+                }
+                s_lastRegTech = RADIO_TECH_UNKNOWN;
+                s_lastRegAct = -1;
+                s_lastSignalValid = 0;
+                if (sState == RADIO_STATE_ON) {
+                    at_send_command("AT+COPS=2", NULL);
+                    s_copsDeregistered = 1;
+                }
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+            } else {
+                s_lastSignalValid = 0;
+                if (sState == RADIO_STATE_ON) {
+                    enableNetworkRegistrationUrks();
+                    s_copsDeregistered = 0;
+                    at_send_command("AT+COPS=0", NULL);
+                    RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &TIMEVAL_RAT_SETTLE);
+                    static const struct timeval settle_3s = {3, 500000};
+                    RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &settle_3s);
+                }
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+            }
             break;
         }
         case RIL_REQUEST_ARE_UICC_APPLICATIONS_ENABLED:
@@ -7389,6 +7461,10 @@ static int getCardStatus(RIL_CardStatus_v1_5 **pp_card_status) {
     int sim_status = getSIMStatus();
     if (sim_status == SIM_ABSENT) {
         card_state = RIL_CARDSTATE_ABSENT;
+        num_apps = 0;
+    } else if (!areUiccApplicationsEnabled) {
+        /* IRadioSim: keep card PRESENT + ICCID accessible, expose 0 active apps */
+        card_state = RIL_CARDSTATE_PRESENT;
         num_apps = 0;
     } else {
         card_state = RIL_CARDSTATE_PRESENT;
