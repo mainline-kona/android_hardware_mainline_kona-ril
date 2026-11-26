@@ -363,9 +363,19 @@ static int sFD;     /* file desc of AT channel */
 static char sATBuffer[MAX_AT_RESPONSE+1];
 static char *sATBufferCur = NULL;
 
-static const struct timeval TIMEVAL_SIMPOLL = {1,0};
+static const struct timeval TIMEVAL_SIMPOLL = {0, 250000};
 static const struct timeval TIMEVAL_CALLSTATEPOLL = {0,500000};
 static const struct timeval TIMEVAL_0 = {0,0};
+static const struct timeval TIMEVAL_SIGNAL_IMMEDIATE = {0, 200000};
+static const struct timeval TIMEVAL_RAT_SETTLE = {1, 500000};
+
+static int s_lastRegTech = RADIO_TECH_UNKNOWN;
+static int s_lastRegAct = -1;
+static int s_lastSignalValid = 0;
+static int s_lastSignal[sizeof(RIL_SignalStrength_v12) / sizeof(int)];
+
+static void pushSignalStrengthOnce(void *param __unused);
+static void notifyNetworkAndSignal(void *param __unused);
 
 static int s_ims_registered  = 0;        // 0==unregistered
 static int s_ims_services    = 1;        // & 0x1 == sms over ims supported
@@ -676,6 +686,47 @@ static RIL_Errno setInterfaceState(const char* interfaceName,
     return RIL_E_SUCCESS;
 }
 
+/**
+ * Arm unsolicited network registration URCs with full location/AcT info (<n>=2).
+ * SDX55 resets +CREG/+CGREG/+CEREG/+C5GREG reporting mode back to 0 across
+ * AT+CFUN=0 -> AT+CFUN=1 (Airplane Mode) and can reject early AT init before
+ * NAS is ready, so call this on init, radio power-on, and SIM-ready.
+ */
+static void enableNetworkRegistrationUrks(void)
+{
+    ATResponse *p_response = NULL;
+    int err;
+
+    err = at_send_command("AT+CREG=2", &p_response);
+    if (err < 0 || !p_response || p_response->success == 0) {
+        at_send_command("AT+CREG=1", NULL);
+    }
+    at_response_free(p_response);
+    p_response = NULL;
+
+    err = at_send_command("AT+CGREG=2", &p_response);
+    if (err < 0 || !p_response || p_response->success == 0) {
+        at_send_command("AT+CGREG=1", NULL);
+    }
+    at_response_free(p_response);
+    p_response = NULL;
+
+    err = at_send_command("AT+CEREG=2", &p_response);
+    if (err < 0 || !p_response || p_response->success == 0) {
+        at_send_command("AT+CEREG=1", NULL);
+    }
+    at_response_free(p_response);
+    p_response = NULL;
+
+    err = at_send_command("AT+C5GREG=2", &p_response);
+    if (err < 0 || !p_response || p_response->success == 0) {
+        at_send_command("AT+C5GREG=1", NULL);
+    }
+    at_response_free(p_response);
+
+    at_send_command("AT+CGEREP=1,0", NULL);
+}
+
 /** do post-AT+CFUN=1 initialization */
 static void onRadioPowerOn()
 {
@@ -690,12 +741,15 @@ static void onRadioPowerOn()
     at_send_command("AT%CTZV=1", NULL);
 #endif
 
+    enableNetworkRegistrationUrks();
+    s_lastSignalValid = 0;
     pollSIMState(NULL);
 }
 
 /** do post- SIM ready initialization */
 static void onSIMReady()
 {
+    enableNetworkRegistrationUrks();
     at_send_command_singleline("AT+CSMS=1", "+CSMS:", NULL);
     /*
      * Always send SMS messages directly to the TE
@@ -708,6 +762,8 @@ static void onSIMReady()
      * bfr = 1  // flush buffer
      */
     at_send_command("AT+CNMI=1,2,2,1,1", NULL);
+    RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+    RIL_requestTimedCallback(pushSignalStrengthOnce, NULL, &TIMEVAL_SIGNAL_IMMEDIATE);
 }
 
 static int useDataconn(void);
@@ -727,6 +783,9 @@ static void requestRadioPower(void *data, size_t datalen __unused, RIL_Token t)
         if (useDataconn()) {
             stopDataconn(0);
         }
+        s_lastRegTech = RADIO_TECH_UNKNOWN;
+        s_lastRegAct = -1;
+        s_lastSignalValid = 0;
         err = at_send_command("AT+CFUN=0", &p_response);
         if (err < 0 || p_response->success == 0) goto error;
         setRadioState(RADIO_STATE_OFF);
@@ -742,7 +801,22 @@ static void requestRadioPower(void *data, size_t datalen __unused, RIL_Token t)
                     goto error;
                 }
             }
+            /*
+             * SDX55 returns OK to AT+CFUN=1 ~600-800 ms before its AT/NAS
+             * layer stops returning ERROR/+CME ERROR: 14. Wait briefly for
+             * AT+CEREG? to succeed before signaling RADIO_STATE_ON so Android
+             * does not enter ServiceStateTracker/DNC retry backoffs.
+             */
+            for (int attempt = 0; attempt < 10; attempt++) {
+                ATResponse *probe = NULL;
+                int perr = at_send_command_singleline("AT+CEREG?", "+CEREG:", &probe);
+                int ok = (perr == 0 && probe && probe->success != 0);
+                at_response_free(probe);
+                if (ok) break;
+                usleep(150000);
+            }
         }
+        enableNetworkRegistrationUrks();
         setRadioState(RADIO_STATE_ON);
     }
 
@@ -2224,6 +2298,8 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
 
     initEmptySignalStrength(ss);
     int got_any = 0;
+    int got_lte = 0;
+    int got_nr = 0;
     size_t pos = 7;
     while (pos + 3 <= (size_t)n) {
         uint8_t t = buf[pos];
@@ -2254,18 +2330,22 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
             if (rssi <= -51 && rssi >= -113) {
                 ss->LTE_SignalStrength.signalStrength = (rssi + 113) / 2;
                 got_any = 1;
+                got_lte = 1;
             }
             if (rsrp <= -44 && rsrp >= -140) {
                 ss->LTE_SignalStrength.rsrp = -rsrp;
                 got_any = 1;
+                got_lte = 1;
             }
             if (rsrq <= -3 && rsrq >= -20) {
                 ss->LTE_SignalStrength.rsrq = -rsrq;
                 got_any = 1;
+                got_lte = 1;
             }
             if (snr >= -200 && snr <= 300) {
                 ss->LTE_SignalStrength.rssnr = snr;
                 got_any = 1;
+                got_lte = 1;
             }
         } else if (t == 0x17 && l >= 4) {
             /* 5G NR: int16 rsrp (dBm), int16 snr (0.1 dB); INT16_MIN = invalid */
@@ -2274,10 +2354,12 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
             if (rsrp != INT16_MIN && rsrp <= -44 && rsrp >= -140) {
                 ss->NR_SignalStrength.ssRsrp = -rsrp;
                 got_any = 1;
+                got_nr = 1;
             }
             if (snr != INT16_MIN && snr >= -230 && snr <= 400) {
                 ss->NR_SignalStrength.ssSinr = snr / 10;
                 got_any = 1;
+                got_nr = 1;
             }
         } else if (t == 0x18 && l >= 2) {
             /* 5G NR Extended: int16 rsrq (dB); INT16_MIN = invalid */
@@ -2285,9 +2367,34 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
             if (rsrq != INT16_MIN && rsrq <= -3 && rsrq >= -20) {
                 ss->NR_SignalStrength.ssRsrq = -rsrq;
                 got_any = 1;
+                got_nr = 1;
             }
         }
         pos += l;
+    }
+
+    /*
+     * During 4G <-> 5G SA handovers SDX55 can briefly report both LTE (0x14)
+     * and NR (0x17) TLVs in GetSignalInfo. Keep only the serving RAT's entry
+     * (unless on EN-DC NSA where act == 13 uses both LTE anchor + NR) so
+     * Android does not oscillate between LTE and NR primary signal bars.
+     */
+    if (got_lte && got_nr && s_lastRegAct != 13) {
+        if (s_lastRegTech == RADIO_TECH_NR) {
+            ss->LTE_SignalStrength.signalStrength = 99;
+            ss->LTE_SignalStrength.rsrp = INT_MAX;
+            ss->LTE_SignalStrength.rsrq = INT_MAX;
+            ss->LTE_SignalStrength.rssnr = INT_MAX;
+            ss->LTE_SignalStrength.cqi = INT_MAX;
+            ss->LTE_SignalStrength.timingAdvance = INT_MAX;
+        } else if (s_lastRegTech == RADIO_TECH_LTE || s_lastRegTech == RADIO_TECH_LTE_CA) {
+            ss->NR_SignalStrength.ssRsrp = INT_MAX;
+            ss->NR_SignalStrength.ssRsrq = INT_MAX;
+            ss->NR_SignalStrength.ssSinr = INT_MAX;
+            ss->NR_SignalStrength.csiRsrp = INT_MAX;
+            ss->NR_SignalStrength.csiRsrq = INT_MAX;
+            ss->NR_SignalStrength.csiSinr = INT_MAX;
+        }
     }
 
     return got_any ? 0 : -1;
@@ -2373,17 +2480,41 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused, 
 }
 
 // A real modem never reports +CSQ on its own, so push signal strength periodically
-static const struct timeval TIMEVAL_SIGNALPOLL = {10, 0};
+static const struct timeval TIMEVAL_SIGNALPOLL = {3, 0};
 static int s_signalPollStarted = 0;
 
-static void pollSignalStrength(void *param __unused)
+static void pushSignalStrengthOnce(void *param __unused)
 {
-    int maxNumOfElements=sizeof(RIL_SignalStrength_v12)/sizeof(int);
+    int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
     int response[maxNumOfElements];
 
     if (sState == RADIO_STATE_ON &&
             readSignalStrength(response, maxNumOfElements) == 0) {
+        memcpy(s_lastSignal, response, sizeof(response));
+        s_lastSignalValid = 1;
         RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
+    }
+}
+
+static void notifyNetworkAndSignal(void *param __unused)
+{
+    if (sState != RADIO_STATE_ON) return;
+    RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+    pushSignalStrengthOnce(NULL);
+}
+
+static void pollSignalStrength(void *param __unused)
+{
+    int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
+    int response[maxNumOfElements];
+
+    if (sState == RADIO_STATE_ON &&
+            readSignalStrength(response, maxNumOfElements) == 0) {
+        if (!s_lastSignalValid || memcmp(s_lastSignal, response, sizeof(response)) != 0) {
+            memcpy(s_lastSignal, response, sizeof(response));
+            s_lastSignalValid = 1;
+            RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
+        }
     }
     RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
 }
@@ -2453,8 +2584,11 @@ static void requestSetPreferredNetworkType(int request, void *data,
 
     if (request != RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE) {
         s_allowedNetworkTypes = value;
+        s_lastSignalValid = 0;
         if (qmiNasSetModePreference(value) == 0) {
             RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+            RIL_requestTimedCallback(pushSignalStrengthOnce, NULL, &TIMEVAL_SIGNAL_IMMEDIATE);
+            RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &TIMEVAL_RAT_SETTLE);
         }
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         return;
@@ -3025,54 +3159,78 @@ static void requestRegistrationState(int request, void *data __unused,
         goto error;
     }
 
-    err = at_send_command_singleline(cmd, prefix, &p_response);
+    // Self-heal if SDX55 ever reverted +C*REG URC mode <n> back to 0 (no TAC/NCI/AcT or URCs).
+    int rearmed_urc = 0;
+    int got_reg = 0;
+    uint64_t cid64 = 0;
+    type = 0;
 
-    if (err < 0 || !p_response->success) goto error;
-
-    line = p_response->p_intermediates->line;
-
-    if (parseRegistrationState(line, &type, &count, &registration)) goto error;
-
-    // On LTE/5G-only networks (e.g. Jio) a real modem leaves +CREG/+CGREG unregistered
-    // and reports the active EPS/5GS bearer in +CEREG or +C5GREG.
-    uint64_t cid64 = s_cid64;
-    if (registration[0] != 1 && registration[0] != 5 && strcmp(cmd, "AT+CEREG?") != 0) {
-        ATResponse *p_eps = NULL;
-        int *eps = NULL, eps_type, eps_count = 3;
-        err = at_send_command_singleline("AT+CEREG?", "+CEREG:", &p_eps);
-        if (err == 0 && p_eps->success) {
-            char *eps_line = p_eps->p_intermediates->line;
-            if (!parseRegistrationState(eps_line, &eps_type, &eps_count, &eps) &&
-                    (eps[0] == 1 || eps[0] == 5)) {
-                free(registration);
-                registration = eps;
-                eps = NULL;
-                type = eps_type;
-                count = eps_count;
-                cid64 = s_cid64;
-            }
-        }
-        free(eps);
-        at_response_free(p_eps);
-    }
-    if (registration[0] != 1 && registration[0] != 5) {
+    // On 5G SA / LTE networks (e.g. Jio), prefer active 5GS (+C5GREG?) first when NR is allowed,
+    // then EPS (+CEREG?), then legacy (+CGREG? / +CREG?) so 4G->5G handovers are never masked
+    // by a transient LTE registration.
+    int nr_allowed = (s_allowedNetworkTypes < 0) || ((s_allowedNetworkTypes & NR) != 0);
+    if (nr_allowed) {
         ATResponse *p_nr = NULL;
-        int *nr = NULL, nr_type, nr_count = 3;
+        int *nr = NULL, nr_type = 0, nr_count = 3;
         err = at_send_command_singleline("AT+C5GREG?", "+C5GREG:", &p_nr);
-        if (err == 0 && p_nr->success) {
+        if (err == 0 && p_nr && p_nr->success) {
             char *nr_line = p_nr->p_intermediates->line;
-            if (!parseRegistrationState(nr_line, &nr_type, &nr_count, &nr) &&
+            if (strstr(nr_line, ": 0,") && !rearmed_urc) {
+                rearmed_urc = 1;
+                at_response_free(p_nr);
+                p_nr = NULL;
+                enableNetworkRegistrationUrks();
+                err = at_send_command_singleline("AT+C5GREG?", "+C5GREG:", &p_nr);
+                nr_line = (err == 0 && p_nr && p_nr->success) ? p_nr->p_intermediates->line : NULL;
+            }
+            if (nr_line && !parseRegistrationState(nr_line, &nr_type, &nr_count, &nr) &&
                     (nr[0] == 1 || nr[0] == 5)) {
-                free(registration);
                 registration = nr;
                 nr = NULL;
                 type = nr_type;
                 count = nr_count;
                 cid64 = s_cid64;
+                got_reg = 1;
             }
         }
         free(nr);
         at_response_free(p_nr);
+    }
+
+    if (!got_reg) {
+        ATResponse *p_eps = NULL;
+        int *eps = NULL, eps_type = 0, eps_count = 3;
+        err = at_send_command_singleline("AT+CEREG?", "+CEREG:", &p_eps);
+        if (err == 0 && p_eps && p_eps->success) {
+            char *eps_line = p_eps->p_intermediates->line;
+            if (strstr(eps_line, ": 0,") && !rearmed_urc) {
+                rearmed_urc = 1;
+                at_response_free(p_eps);
+                p_eps = NULL;
+                enableNetworkRegistrationUrks();
+                err = at_send_command_singleline("AT+CEREG?", "+CEREG:", &p_eps);
+                eps_line = (err == 0 && p_eps && p_eps->success) ? p_eps->p_intermediates->line : NULL;
+            }
+            if (eps_line && !parseRegistrationState(eps_line, &eps_type, &eps_count, &eps) &&
+                    (eps[0] == 1 || eps[0] == 5)) {
+                registration = eps;
+                eps = NULL;
+                type = eps_type;
+                count = eps_count;
+                cid64 = s_cid64;
+                got_reg = 1;
+            }
+        }
+        free(eps);
+        at_response_free(p_eps);
+    }
+
+    if (!got_reg) {
+        err = at_send_command_singleline(cmd, prefix, &p_response);
+        if (err < 0 || !p_response->success) goto error;
+        line = p_response->p_intermediates->line;
+        if (parseRegistrationState(line, &type, &count, &registration)) goto error;
+        cid64 = s_cid64;
     }
 
     responseStr = malloc(numElements * sizeof(char *));
@@ -3113,11 +3271,36 @@ static void requestRegistrationState(int request, void *data __unused,
             asprintf(&responseStr[2], "%" PRIx64, cid64);
         }
         if (count > 3) {
+            int tech = mapNetworkRegistrationResponse(registration[3]);
             act = registration[3];
-            asprintf(&responseStr[3], "%d", mapNetworkRegistrationResponse(registration[3]));
+            asprintf(&responseStr[3], "%d", tech);
+            if (registration[0] == 1 || registration[0] == 5) {
+                int prevTech = s_lastRegTech;
+                s_lastRegTech = tech;
+                s_lastRegAct = act;
+                if (prevTech != tech) {
+                    s_lastSignalValid = 0;
+                    RIL_requestTimedCallback(pushSignalStrengthOnce, NULL, &TIMEVAL_SIGNAL_IMMEDIATE);
+                }
+            } else {
+                s_lastRegTech = RADIO_TECH_UNKNOWN;
+                s_lastRegAct = -1;
+            }
         } else if (registration[0] == 1 || registration[0] == 5) {
             int tech = getCopsRadioTech(&act);
-            if (tech != RADIO_TECH_UNKNOWN) asprintf(&responseStr[3], "%d", tech);
+            if (tech != RADIO_TECH_UNKNOWN) {
+                int prevTech = s_lastRegTech;
+                asprintf(&responseStr[3], "%d", tech);
+                s_lastRegTech = tech;
+                s_lastRegAct = act;
+                if (prevTech != tech) {
+                    s_lastSignalValid = 0;
+                    RIL_requestTimedCallback(pushSignalStrengthOnce, NULL, &TIMEVAL_SIGNAL_IMMEDIATE);
+                }
+            }
+        } else {
+            s_lastRegTech = RADIO_TECH_UNKNOWN;
+            s_lastRegAct = -1;
         }
     }
     asprintf(&responseStr[0], "%d", registration[0]);
@@ -7433,9 +7616,6 @@ static void probeForModemMode(ModemInfo *info)
  */
 static void initializeCallback(void *param __unused)
 {
-    ATResponse *p_response = NULL;
-    int err;
-
     /*
      * Keep sState UNAVAILABLE until AT handshake and URC setup complete so
      * com.android.phone does not race RADIO_POWER (AT+CFUN=1) with init.
@@ -7456,20 +7636,8 @@ static void initializeCallback(void *param __unused)
     /*  Extended errors */
     at_send_command("AT+CMEE=1", NULL);
 
-    /*  Network registration events */
-    err = at_send_command("AT+CREG=2", &p_response);
-
-    /* some handsets -- in tethered mode -- don't support CREG=2 */
-    if (err < 0 || p_response->success == 0) {
-        at_send_command("AT+CREG=1", NULL);
-    }
-
-    at_response_free(p_response);
-
-    /*  GPRS, EPS (LTE), and 5GS (NR SA) registration events */
-    at_send_command("AT+CGREG=1", NULL);
-    at_send_command("AT+CEREG=2", NULL);
-    at_send_command("AT+C5GREG=2", NULL);
+    /*  Network, GPRS, EPS (LTE), and 5GS (NR SA) registration events */
+    enableNetworkRegistrationUrks();
 
     /*  Call Waiting notifications */
     at_send_command("AT+CCWA=1", NULL);
@@ -7688,6 +7856,7 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         RIL_onUnsolicitedResponse (
             RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,
             NULL, 0);
+        RIL_requestTimedCallback(pushSignalStrengthOnce, NULL, &TIMEVAL_SIGNAL_IMMEDIATE);
 #ifdef WORKAROUND_FAKE_CGEV
         RIL_requestTimedCallback (onDataCallListChanged, NULL, NULL);
 #endif /* WORKAROUND_FAKE_CGEV */
