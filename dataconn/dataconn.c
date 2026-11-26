@@ -187,12 +187,30 @@ static void print_ipv4(const char *key, guint32 addr) {
     printf("%s=%s\n", key, inet_ntoa(in));
 }
 
+static gboolean s_disconnected;
+static gboolean s_handover;
+
 static gboolean on_sigterm(gpointer loop) {
     g_main_loop_quit(loop);
     return G_SOURCE_REMOVE;
 }
 
-static gboolean s_disconnected;
+static gboolean on_handover_timeout(gpointer loop) {
+    g_main_loop_quit(loop);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_sigusr1(gpointer loop) {
+    s_handover = TRUE;
+    if (s_disconnected) {
+        g_main_loop_quit(loop);
+    } else {
+        /* Give an in-flight network Delete Bearer indication a moment to arrive
+         * before releasing the local link and WDS client without STOP_NETWORK. */
+        g_timeout_add(400, on_handover_timeout, loop);
+    }
+    return G_SOURCE_REMOVE;
+}
 
 static void on_packet_service_status(QmiClientWds *wds, QmiIndicationWdsPacketServiceStatusOutput *ind,
                                      gpointer loop) {
@@ -216,6 +234,65 @@ static QrtrNode *find_wds_node(QrtrBus *bus) {
         }
     }
     return NULL;
+}
+
+static guint8 find_or_create_3gpp_profile(QmiClientWds *wds, const char *apn, Wait *w) {
+    if (!wds || !apn || !apn[0]) return 0;
+
+    g_autoptr(QmiMessageWdsGetProfileListInput) lin = qmi_message_wds_get_profile_list_input_new();
+    qmi_message_wds_get_profile_list_input_set_profile_type(lin, QMI_WDS_PROFILE_TYPE_3GPP, NULL);
+    qmi_client_wds_get_profile_list(wds, lin, 10, NULL, on_done, w);
+    g_autoptr(QmiMessageWdsGetProfileListOutput) lout =
+            qmi_client_wds_get_profile_list_finish(wds, wait_result(w), NULL);
+    GArray *plist = NULL;
+    if (lout && qmi_message_wds_get_profile_list_output_get_result(lout, NULL) &&
+        qmi_message_wds_get_profile_list_output_get_profile_list(lout, &plist, NULL) && plist) {
+        for (guint i = 0; i < plist->len; i++) {
+            const QmiMessageWdsGetProfileListOutputProfileListProfile *entry =
+                    &g_array_index(plist, QmiMessageWdsGetProfileListOutputProfileListProfile, i);
+            g_autoptr(QmiMessageWdsGetProfileSettingsInput) sin =
+                    qmi_message_wds_get_profile_settings_input_new();
+            qmi_message_wds_get_profile_settings_input_set_profile_id(
+                    sin, QMI_WDS_PROFILE_TYPE_3GPP, entry->profile_index, NULL);
+            qmi_client_wds_get_profile_settings(wds, sin, 10, NULL, on_done, w);
+            g_autoptr(QmiMessageWdsGetProfileSettingsOutput) sout =
+                    qmi_client_wds_get_profile_settings_finish(wds, wait_result(w), NULL);
+            const gchar *prof_apn = NULL;
+            if (sout && qmi_message_wds_get_profile_settings_output_get_result(sout, NULL) &&
+                qmi_message_wds_get_profile_settings_output_get_apn_name(sout, &prof_apn, NULL) &&
+                prof_apn && g_ascii_strcasecmp(prof_apn, apn) == 0) {
+                return entry->profile_index;
+            }
+        }
+    }
+
+    /* No existing 3GPP profile matches this APN; create one so 5G SA StartNetwork
+     * does not fall back to default profile 1 (already bound to mux_id 1). */
+    g_autoptr(QmiMessageWdsCreateProfileInput) cin = qmi_message_wds_create_profile_input_new();
+    qmi_message_wds_create_profile_input_set_profile_type(cin, QMI_WDS_PROFILE_TYPE_3GPP, NULL);
+    qmi_message_wds_create_profile_input_set_apn_name(cin, apn, NULL);
+    qmi_message_wds_create_profile_input_set_pdp_type(cin, QMI_WDS_PDP_TYPE_IPV4_OR_IPV6, NULL);
+    qmi_client_wds_create_profile(wds, cin, 10, NULL, on_done, w);
+    g_autoptr(QmiMessageWdsCreateProfileOutput) cout =
+            qmi_client_wds_create_profile_finish(wds, wait_result(w), NULL);
+    guint8 created_idx = 0;
+    if (cout && qmi_message_wds_create_profile_output_get_result(cout, NULL) &&
+        qmi_message_wds_create_profile_output_get_profile_identifier(cout, NULL, &created_idx, NULL)) {
+        return created_idx;
+    }
+    return 0;
+}
+
+static void print_start_network_error(QmiMessageWdsStartNetworkOutput *out) {
+    if (!out) return;
+    QmiWdsCallEndReason reason;
+    if (qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
+        printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
+    QmiWdsVerboseCallEndReasonType vtype;
+    gint16 vreason;
+    if (qmi_message_wds_start_network_output_get_verbose_call_end_reason(out, &vtype, &vreason, NULL))
+        printf("verbose_end_reason=%s(%d):%d\n",
+               qmi_wds_verbose_call_end_reason_type_get_string(vtype), (int)vtype, (int)vreason);
 }
 
 static void release_client(QmiDevice *dev, QmiClient *client, Wait *w) {
@@ -481,6 +558,15 @@ int main(int argc, char **argv) {
     }
 
     /*
+     * On 5G NR SA, QMI WDS StartNetwork without a 3GPP profile index defaults
+     * to profile 1 (already bound to mux_id 1 for default internet) and rejects
+     * secondary APNs such as "ims" with INTERNAL_CALL_ALREADY_PRESENT (236).
+     * Resolve or create the matching 3GPP profile index before starting.
+     */
+    guint8 profile_idx = find_or_create_3gpp_profile(
+            QMI_CLIENT_WDS(wds6 ? wds6 : wds4), apn, &w);
+
+    /*
      * Bring up IPv6 before IPv4 on dual-stack carriers (such as Jio 5G SA / VoLTE):
      * starting IPv4 first on an IPv6-only/464XLAT bearer can trigger modem CLAT
      * state that blocks a subsequent IPv6 StartNetwork on the same mux_id.
@@ -489,15 +575,14 @@ int main(int argc, char **argv) {
     if (wds6) {
         g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
         if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
+        if (profile_idx) qmi_message_wds_start_network_input_set_profile_index_3gpp(in, profile_idx, NULL);
         qmi_message_wds_start_network_input_set_ip_family_preference(in, QMI_WDS_IP_FAMILY_IPV6, NULL);
         qmi_client_wds_start_network(QMI_CLIENT_WDS(wds6), in, 60, NULL, on_done, &w);
         g_autoptr(QmiMessageWdsStartNetworkOutput) out =
                 qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds6), wait_result(&w), &error);
         if (!out || !qmi_message_wds_start_network_output_get_result(out, &error)) {
             if (!wds4) {
-                QmiWdsCallEndReason reason;
-                if (out && qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
-                    printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
+                print_start_network_error(out);
                 qmi_device_delete_link(dev, ifname, mux_id, NULL, on_done, &w);
                 qmi_device_delete_link_finish(dev, wait_result(&w), NULL);
                 fail("start network v6", error);
@@ -510,15 +595,14 @@ int main(int argc, char **argv) {
     if (wds4) {
         g_autoptr(QmiMessageWdsStartNetworkInput) in = qmi_message_wds_start_network_input_new();
         if (apn[0]) qmi_message_wds_start_network_input_set_apn(in, apn, NULL);
+        if (profile_idx) qmi_message_wds_start_network_input_set_profile_index_3gpp(in, profile_idx, NULL);
         qmi_message_wds_start_network_input_set_ip_family_preference(in, QMI_WDS_IP_FAMILY_IPV4, NULL);
         qmi_client_wds_start_network(QMI_CLIENT_WDS(wds4), in, 60, NULL, on_done, &w);
         g_autoptr(QmiMessageWdsStartNetworkOutput) out =
                 qmi_client_wds_start_network_finish(QMI_CLIENT_WDS(wds4), wait_result(&w), &error);
         if (!out || !qmi_message_wds_start_network_output_get_result(out, &error)) {
             if (!handle6) {
-                QmiWdsCallEndReason reason;
-                if (out && qmi_message_wds_start_network_output_get_call_end_reason(out, &reason, NULL))
-                    printf("end_reason=%s\n", qmi_wds_call_end_reason_get_string(reason));
+                print_start_network_error(out);
                 qmi_device_delete_link(dev, ifname, mux_id, NULL, on_done, &w);
                 qmi_device_delete_link_finish(dev, wait_result(&w), NULL);
                 fail("start network v4", error);
@@ -660,11 +744,12 @@ int main(int argc, char **argv) {
 
     g_unix_signal_add(SIGTERM, on_sigterm, w.loop);
     g_unix_signal_add(SIGINT, on_sigterm, w.loop);
+    g_unix_signal_add(SIGUSR1, on_sigusr1, w.loop);
     if (wds4) g_signal_connect(wds4, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);
     if (wds6) g_signal_connect(wds6, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);
     g_main_loop_run(w.loop);
 
-    if (!s_disconnected) {
+    if (!s_disconnected && !s_handover) {
         if (handle4 && wds4) {
             g_autoptr(QmiMessageWdsStopNetworkInput) in = qmi_message_wds_stop_network_input_new();
             qmi_message_wds_stop_network_input_set_packet_data_handle(in, handle4, NULL);

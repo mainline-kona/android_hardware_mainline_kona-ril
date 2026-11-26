@@ -728,6 +728,8 @@ static void enableNetworkRegistrationUrks(void)
     at_send_command("AT+CGEREP=1,0", NULL);
 }
 
+static void qmiDisableModemIms(void);
+
 /** do post-AT+CFUN=1 initialization */
 static void onRadioPowerOn()
 {
@@ -742,6 +744,7 @@ static void onRadioPowerOn()
     at_send_command("AT%CTZV=1", NULL);
 #endif
 
+    qmiDisableModemIms();
     enableNetworkRegistrationUrks();
     s_lastSignalValid = 0;
     pollSIMState(NULL);
@@ -750,6 +753,7 @@ static void onRadioPowerOn()
 /** do post- SIM ready initialization */
 static void onSIMReady()
 {
+    qmiDisableModemIms();
     enableNetworkRegistrationUrks();
     if (areUiccApplicationsEnabled && s_copsDeregistered) {
         s_copsDeregistered = 0;
@@ -978,15 +982,20 @@ static int useDataconn(void) {
     return access(DATACONN_PATH, X_OK) == 0;
 }
 
-static void stopDataconn(int cid) {
+static void stopDataconnEx(int cid, int handover) {
+    int sig = handover ? SIGUSR1 : SIGTERM;
     for (int i = 0; i < MAX_PDP; i++) {
         if (cid > 0 && (i + 1) != cid) continue;
         if (s_sessions[i].pid > 0) {
-            kill(s_sessions[i].pid, SIGTERM);
+            kill(s_sessions[i].pid, sig);
             waitpid(s_sessions[i].pid, NULL, 0);
         }
         s_sessions[i].pid = -1;
     }
+}
+
+static void stopDataconn(int cid) {
+    stopDataconnEx(cid, 0);
 }
 
 static int dataconnAlive(int idx) {
@@ -1935,6 +1944,64 @@ static int qmiEnsureDms(void)
     return 0;
 }
 
+/*
+ * This device runs an AP-side IMS stack (com.android.imsstack + Iwlan) rather
+ * than Qualcomm's proprietary modem IMS daemon. Carrier MCFG profiles on SDX55
+ * (e.g. Jio) leave modem-side IMS services enabled in QMI_SERVICE_IMS (0x12),
+ * causing MPSS to claim the 3GPP 'ims' PDN on its own and make the carrier
+ * PGW/ePDG tear down AP-side VoWiFi tunnels with IKEv2 Delete + Notify(40961)
+ * (REACTIVATION_REQUESTED_CAUSE). Disable modem-side IMS services over QMI so
+ * AP-side VoLTE/VoNR/VoWiFi owns the 'ims' PDN exclusively.
+ */
+static void qmiDisableModemIms(void)
+{
+    uint32_t node = 0, port = 0;
+    if (qmiLookupService(18 /* QMI_SERVICE_IMS */, &node, &port) < 0) {
+        return;
+    }
+
+    static const uint8_t disable_tlvs[] = {
+        0x10, 0x01, 0x00, 0x00, /* IMS Voice Over LTE Enable = false */
+        0x11, 0x01, 0x00, 0x00, /* IMS Video Telephony Service Enable = false */
+        0x14, 0x01, 0x00, 0x00, /* IMS Voice WiFi Service Enable = false */
+        0x18, 0x01, 0x00, 0x00, /* IMS Service Enabled = false */
+        0x19, 0x01, 0x00, 0x00, /* IMS UT Service Enable = false */
+        0x1A, 0x01, 0x00, 0x00, /* IMS SMS Service Enable = false */
+        0x1C, 0x01, 0x00, 0x00, /* IMS USSD Service Enabled = false */
+        0x1E, 0x01, 0x00, 0x00, /* IMS Presence Enabled = false */
+        0x21, 0x01, 0x00, 0x00, /* IMS RCS Enabled = false */
+    };
+
+    for (uint32_t sub = 0; sub < 2; sub++) {
+        int fd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return;
+
+        uint8_t bind_tlv[] = {
+            0x01, 0x04, 0x00,
+            (uint8_t)(sub & 0xff), (uint8_t)((sub >> 8) & 0xff),
+            (uint8_t)((sub >> 16) & 0xff), (uint8_t)((sub >> 24) & 0xff),
+        };
+        uint8_t resp[256];
+        uint16_t qerr = 0;
+        ssize_t n = qmiSendRecvFd(fd, node, port, 0x0098 /* QMI_IMS_BIND */,
+                                  bind_tlv, sizeof(bind_tlv), resp, sizeof(resp), 1000);
+        if (n < 7 || qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
+            close(fd);
+            continue;
+        }
+
+        n = qmiSendRecvFd(fd, node, port, 0x008F /* QMI_IMS_SET_IMS_SERVICES_ENABLED_SETTING */,
+                          disable_tlvs, sizeof(disable_tlvs), resp, sizeof(resp), 1000);
+        if (n >= 7 && qmiCheckResultTlv(resp, (size_t)n, &qerr) == 0) {
+            RLOGI("QMI IMS: disabled modem-side IMS services (sub=%u)", sub);
+        } else if (sub == 0) {
+            RLOGW("QMI IMS: failed to disable modem-side IMS services (sub=%u, n=%zd, err=0x%04x)",
+                  sub, n, qerr);
+        }
+        close(fd);
+    }
+}
+
 static int qmiExtractStringTlv(const uint8_t *buf, size_t len, uint8_t target_tlv,
                                char *out, size_t out_cap)
 {
@@ -2468,6 +2535,8 @@ static int qmiUimSendApdu(uint8_t ch, const uint8_t *apdu, size_t apdu_len,
     return -1;
 }
 
+static int s_qmiSignalRatMismatch = 0;
+
 static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
 {
     if (qmiEnsureNas() < 0) return -1;
@@ -2578,6 +2647,21 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
             ss->NR_SignalStrength.csiRsrp = INT_MAX;
             ss->NR_SignalStrength.csiRsrq = INT_MAX;
             ss->NR_SignalStrength.csiSinr = INT_MAX;
+        }
+    }
+
+    /*
+     * SDX55 can silently reselect between 4G LTE and 5G NR SA without emitting
+     * an AT +CEREG/+C5GREG URC, leaving ServiceState stale on the old RAT while
+     * SignalStrength only carries the new RAT (causing QNS to see INT_MAX for
+     * the old RAT and block IWLAN <-> cellular handovers). Flag unambiguous
+     * mismatches so pollSignalStrength triggers a registration refresh.
+     */
+    s_qmiSignalRatMismatch = 0;
+    if (s_lastRegAct != 13 && s_lastRegTech != RADIO_TECH_UNKNOWN) {
+        if ((got_nr && !got_lte && s_lastRegTech != RADIO_TECH_NR) ||
+            (got_lte && !got_nr && s_lastRegTech == RADIO_TECH_NR)) {
+            s_qmiSignalRatMismatch = 1;
         }
     }
 
@@ -2694,6 +2778,10 @@ static void pollSignalStrength(void *param __unused)
 
     if (sState == RADIO_STATE_ON &&
             readSignalStrength(response, maxNumOfElements) == 0) {
+        if (s_qmiSignalRatMismatch) {
+            s_qmiSignalRatMismatch = 0;
+            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+        }
         if (!s_lastSignalValid || memcmp(s_lastSignal, response, sizeof(response)) != 0) {
             memcpy(s_lastSignal, response, sizeof(response));
             s_lastSignalValid = 1;
@@ -4336,14 +4424,16 @@ error:
     at_response_free(p_response);
 }
 
-static void requestDeactivateDataCall(void *data, RIL_Token t)
+static void requestDeactivateDataCall(void *data, size_t datalen, RIL_Token t)
 {
     const char *p_cid = ((const char **)data)[0];
+    const char *p_reason = (datalen >= 2 * sizeof(char *)) ? ((const char **)data)[1] : NULL;
     int cid = p_cid ? atoi(p_cid) : -1;
+    int is_handover = (p_reason && !strcmp(p_reason, "handover"));
     RIL_Errno rilErrno = RIL_E_GENERIC_FAILURE;
 
     if (useDataconn()) {
-        stopDataconn(cid);
+        stopDataconnEx(cid, is_handover);
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         sendDataconnCallList(NULL);
         return;
@@ -5097,11 +5187,13 @@ static void requestScreenState(void *data, RIL_Token t)
     if (!status) {
         /* Suspend */
         at_send_command("AT+CEREG=1", NULL);
+        at_send_command("AT+C5GREG=1", NULL);
         at_send_command("AT+CREG=1", NULL);
         at_send_command("AT+CGREG=1", NULL);
     } else {
        /* Resume */
         at_send_command("AT+CEREG=2", NULL);
+        at_send_command("AT+C5GREG=2", NULL);
         at_send_command("AT+CREG=2", NULL);
         at_send_command("AT+CGREG=2", NULL);
     }
@@ -6579,7 +6671,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             requestSetupDataCall(data, datalen, t);
             break;
         case RIL_REQUEST_DEACTIVATE_DATA_CALL:
-            requestDeactivateDataCall(data, t);
+            requestDeactivateDataCall(data, datalen, t);
             break;
         case RIL_REQUEST_SMS_ACKNOWLEDGE:
             requestSMSAcknowledge(data, datalen, t);
@@ -7893,6 +7985,9 @@ static void initializeCallback(void *param __unused)
 
     /*  Network, GPRS, EPS (LTE), and 5GS (NR SA) registration events */
     enableNetworkRegistrationUrks();
+
+    /*  Disable SDX55 modem-side internal IMS so AP-side ImsStack/Iwlan owns IMS */
+    qmiDisableModemIms();
 
     /*  Call Waiting notifications */
     at_send_command("AT+CCWA=1", NULL);
