@@ -34,6 +34,7 @@ cc_library {
         "RefRadioModem.cpp",
         "RefRadioNetwork.cpp",
         "RefRadioSim.cpp",
+        "RefRadioVoice.cpp",
         "RilSapSocket.cpp",
         "ril.cpp",
         "ril_config.cpp",

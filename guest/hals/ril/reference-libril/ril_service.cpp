@@ -21,6 +21,7 @@
 #include "RefRadioModem.h"
 #include "RefRadioNetwork.h"
 #include "RefRadioSim.h"
+#include "RefRadioVoice.h"
 
 #include <android-base/logging.h>
 #include <android/binder_manager.h>
@@ -6618,7 +6619,8 @@ int radio_1_6::getVoiceRegistrationStateResponse(int slotId,
                 } else if (rat == RADIO_TECH_NR) {
                     // rat is NR only for NR SA
                     V1_6::NrVopsInfo nrVopsInfo;
-                    nrVopsInfo.vopsSupported = registered
+                    bool nrVops = registered && cf::ril::isVoNrEnabledForSlot(slotId);
+                    nrVopsInfo.vopsSupported = nrVops
                             ? ::android::hardware::radio::V1_6::VopsIndicator::VOPS_OVER_3GPP
                             : ::android::hardware::radio::V1_6::VopsIndicator::VOPS_NOT_SUPPORTED;
                     nrVopsInfo.emcSupported = registered
@@ -6802,7 +6804,8 @@ int radio_1_6::getDataRegistrationStateResponse(int slotId, int responseType, in
                 if (rat == RADIO_TECH_NR) {
                     // rat is NR only for NR SA
                     V1_6::NrVopsInfo nrVopsInfo;
-                    nrVopsInfo.vopsSupported = registered
+                    bool nrVops = registered && cf::ril::isVoNrEnabledForSlot(slotId);
+                    nrVopsInfo.vopsSupported = nrVops
                             ? ::android::hardware::radio::V1_6::VopsIndicator::VOPS_OVER_3GPP
                             : ::android::hardware::radio::V1_6::VopsIndicator::VOPS_NOT_SUPPORTED;
                     nrVopsInfo.emcSupported = registered
@@ -13578,8 +13581,10 @@ int radio_1_6::oemHookRawInd(int slotId,
 }
 
 template <typename T>
-static void publishRadioHal(std::shared_ptr<compat::DriverContext> ctx, sp<V1_5::IRadio> hidlHal,
-                            std::shared_ptr<compat::CallbackManager> cm, const std::string& slot) {
+static std::shared_ptr<T> publishRadioHal(std::shared_ptr<compat::DriverContext> ctx,
+                                          sp<V1_5::IRadio> hidlHal,
+                                          std::shared_ptr<compat::CallbackManager> cm,
+                                          const std::string& slot) {
     static std::vector<std::shared_ptr<ndk::ICInterface>> gPublishedHals;
 
     const auto instance = T::descriptor + "/"s + slot;
@@ -13589,13 +13594,14 @@ static void publishRadioHal(std::shared_ptr<compat::DriverContext> ctx, sp<V1_5:
         RLOGW("%s is not declared in VINTF (this may be intentional on `next` when interface is "
               "not frozen)",
               instance.c_str());
-        return;
+        return nullptr;
     }
 
     auto aidlHal = ndk::SharedRefBase::make<T>(ctx, hidlHal, cm);
     gPublishedHals.push_back(aidlHal);
     const auto status = AServiceManager_addService(aidlHal->asBinder().get(), instance.c_str());
     CHECK_EQ(status, STATUS_OK);
+    return aidlHal;
 }
 
 void radio_1_6::registerService(RIL_RadioFunctions *callbacks, CommandInfo *commands) {
@@ -13645,7 +13651,10 @@ void radio_1_6::registerService(RIL_RadioFunctions *callbacks, CommandInfo *comm
         publishRadioHal<compat::RadioData>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<compat::RadioMessaging>(context, radioHidl, callbackMgr, slot);
         publishRadioHal<cf::ril::RefRadioNetwork>(context, radioHidl, callbackMgr, slot);
-        publishRadioHal<compat::RadioVoice>(context, radioHidl, callbackMgr, slot);
+        if (auto voiceHal =
+                    publishRadioHal<cf::ril::RefRadioVoice>(context, radioHidl, callbackMgr, slot)) {
+            voiceHal->setSlotId(i);
+        }
         publishRadioHal<cf::ril::RefRadioIms>(context, radioHidl, callbackMgr, slot);
         if (i == 0) {
             publishRadioHal<cf::ril::RefImsMedia>(context, radioHidl, callbackMgr,
