@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -40,10 +41,12 @@
 
 #define MAX_AT_RESPONSE (8 * 1024)
 #define HANDSHAKE_RETRY_COUNT 8
-#define HANDSHAKE_TIMEOUT_MSEC 250
+#define HANDSHAKE_TIMEOUT_MSEC 500
 
 static pthread_t s_tid_reader;
+static int s_readerRunning = 0;
 static int s_fd = -1;    /* fd of the AT channel */
+static int s_wakePipe[2] = { -1, -1 };
 static ATUnsolHandler s_unsolHandler;
 
 /* for input buffering */
@@ -72,6 +75,7 @@ void  AT_DUMP(const char*  prefix __unused, const char*  buff, int  len)
 static pthread_mutex_t s_commandmutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_commandcond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t s_writeMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_closeMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static ATCommandType s_type;
 static const char *s_responsePrefix = NULL;
@@ -322,7 +326,7 @@ static char * findNextEOL(char *cur)
  * have buffered stdio.
  */
 
-static const char *readline()
+static const char *readline(int fd, int wake_fd)
 {
     ssize_t count;
 
@@ -363,6 +367,9 @@ static const char *readline()
     }
 
     while (p_eol == NULL) {
+        struct pollfd pfds[2];
+        int pret;
+
         if (0 == MAX_AT_RESPONSE - (p_read - s_ATBuffer)) {
             RLOGE("ERROR: Input line exceeded buffer\n");
             /* ditch buffer and start over again */
@@ -371,8 +378,35 @@ static const char *readline()
             p_read = s_ATBuffer;
         }
 
+        if (s_readerClosed) {
+            return NULL;
+        }
+
+        pfds[0].fd = fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = wake_fd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+
         do {
-            count = read(s_fd, p_read,
+            pret = poll(pfds, wake_fd >= 0 ? 2 : 1, -1);
+        } while (pret < 0 && errno == EINTR);
+
+        if (pret < 0 || s_readerClosed) {
+            return NULL;
+        }
+        if (wake_fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            return NULL;
+        }
+        if ((pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+            !(pfds[0].revents & POLLIN)) {
+            RLOGD("atchannel: poll hangup/error revents=0x%x", pfds[0].revents);
+            return NULL;
+        }
+
+        do {
+            count = read(fd, p_read,
                             MAX_AT_RESPONSE - (p_read - s_ATBuffer));
         } while (count < 0 && errno == EINTR);
 
@@ -418,7 +452,7 @@ static void onReaderClosed()
 
         s_readerClosed = 1;
 
-        pthread_cond_signal(&s_commandcond);
+        pthread_cond_broadcast(&s_commandcond);
 
         pthread_mutex_unlock(&s_commandmutex);
 
@@ -429,10 +463,13 @@ static void onReaderClosed()
 
 static void *readerLoop(void *arg __unused)
 {
+    int fd = s_fd;
+    int wake_fd = s_wakePipe[0];
+
     for (;;) {
         const char * line;
 
-        line = readline();
+        line = readline(fd, wake_fd);
 
         if (line == NULL) {
             break;
@@ -446,7 +483,7 @@ static void *readerLoop(void *arg __unused)
             // till next call to 'readline()' hence making a copy of line
             // before calling readline again.
             line1 = strdup(line);
-            line2 = readline();
+            line2 = readline(fd, wake_fd);
 
             if (line2 == NULL) {
                 free(line1);
@@ -572,48 +609,109 @@ static void clearPendingCommand()
 int at_open(int fd, ATUnsolHandler h)
 {
     int ret;
-    pthread_t tid;
     pthread_attr_t attr;
+
+    /* Ensure any previous readerLoop has fully exited before opening a new one. */
+    if (s_readerRunning || s_fd >= 0) {
+        at_close();
+    }
 
     s_fd = fd;
     s_unsolHandler = h;
     s_readerClosed = 0;
 
+    s_ATBufferCur = s_ATBuffer;
+    s_ATBuffer[0] = '\0';
+
     s_responsePrefix = NULL;
     s_smsPDU = NULL;
     sp_response = NULL;
 
+    if (pipe(s_wakePipe) == 0) {
+        fcntl(s_wakePipe[0], F_SETFD, FD_CLOEXEC);
+        fcntl(s_wakePipe[1], F_SETFD, FD_CLOEXEC);
+        fcntl(s_wakePipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(s_wakePipe[1], F_SETFL, O_NONBLOCK);
+    } else {
+        s_wakePipe[0] = -1;
+        s_wakePipe[1] = -1;
+    }
+
     pthread_attr_init (&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
-    ret = pthread_create(&s_tid_reader, &attr, readerLoop, &attr);
+    pthread_mutex_lock(&s_closeMutex);
+    ret = pthread_create(&s_tid_reader, &attr, readerLoop, NULL);
+    pthread_attr_destroy(&attr);
 
-    if (ret < 0) {
-        perror ("pthread_create");
+    if (ret != 0) {
+        pthread_mutex_unlock(&s_closeMutex);
+        RLOGE("pthread_create failed: %s", strerror(ret));
+        if (s_wakePipe[0] >= 0) {
+            close(s_wakePipe[0]);
+            s_wakePipe[0] = -1;
+        }
+        if (s_wakePipe[1] >= 0) {
+            close(s_wakePipe[1]);
+            s_wakePipe[1] = -1;
+        }
+        s_fd = -1;
         return -1;
     }
 
-
+    s_readerRunning = 1;
+    pthread_mutex_unlock(&s_closeMutex);
     return 0;
 }
 
-/* FIXME is it ok to call this from the reader and the command thread? */
+/* Safe to call from either the reader thread or command/main threads. */
 void at_close()
 {
-    if (s_fd >= 0) {
-        close(s_fd);
-    }
-    s_fd = -1;
+    pthread_t tid_to_join;
+    int need_join = 0;
+
+    pthread_mutex_lock(&s_closeMutex);
 
     pthread_mutex_lock(&s_commandmutex);
-
     s_readerClosed = 1;
-
-    pthread_cond_signal(&s_commandcond);
-
+    pthread_cond_broadcast(&s_commandcond);
     pthread_mutex_unlock(&s_commandmutex);
 
-    /* the reader thread should eventually die */
+    if (s_wakePipe[1] >= 0) {
+        char b = 'x';
+        ssize_t unused __unused = write(s_wakePipe[1], &b, 1);
+    }
+
+    if (s_readerRunning) {
+        if (pthread_equal(s_tid_reader, pthread_self())) {
+            pthread_detach(s_tid_reader);
+        } else {
+            tid_to_join = s_tid_reader;
+            need_join = 1;
+        }
+        s_readerRunning = 0;
+    }
+
+    pthread_mutex_unlock(&s_closeMutex);
+
+    if (need_join) {
+        pthread_join(tid_to_join, NULL);
+    }
+
+    pthread_mutex_lock(&s_closeMutex);
+    if (s_fd >= 0) {
+        close(s_fd);
+        s_fd = -1;
+    }
+    if (s_wakePipe[0] >= 0) {
+        close(s_wakePipe[0]);
+        s_wakePipe[0] = -1;
+    }
+    if (s_wakePipe[1] >= 0) {
+        close(s_wakePipe[1]);
+        s_wakePipe[1] = -1;
+    }
+    pthread_mutex_unlock(&s_closeMutex);
 }
 
 static ATResponse * at_response_new()
@@ -743,7 +841,7 @@ static int at_send_command_full (const char *command, ATCommandType type,
     int err;
     bool inEmulator;
 
-    if (0 != pthread_equal(s_tid_reader, pthread_self())) {
+    if (s_readerRunning && 0 != pthread_equal(s_tid_reader, pthread_self())) {
         /* cannot be called from reader thread */
         return AT_ERROR_INVALID_THREAD;
     }
@@ -898,13 +996,26 @@ int at_handshake()
     int i;
     int err = 0;
 
-    for (i = 0; i < HANDSHAKE_RETRY_COUNT && err != AT_ERROR_INVALID_THREAD; i++) {
-        /* some stacks start with verbose off */
-        err = at_send_command_full("ATE0Q0V1", NO_RESULT, NULL, NULL, HANDSHAKE_TIMEOUT_MSEC, NULL);
+    if (s_readerRunning && 0 != pthread_equal(s_tid_reader, pthread_self())) {
+        return AT_ERROR_INVALID_THREAD;
+    }
 
-        if (err == 0) {
+    for (i = 0; i < HANDSHAKE_RETRY_COUNT; i++) {
+        /* some stacks start with verbose off; retry before firing onTimeout */
+        pthread_mutex_lock(&s_writeMutex);
+        pthread_mutex_lock(&s_commandmutex);
+        err = at_send_command_full_nolock("ATE0Q0V1", NO_RESULT, NULL, NULL,
+                                          HANDSHAKE_TIMEOUT_MSEC, NULL);
+        pthread_mutex_unlock(&s_commandmutex);
+        pthread_mutex_unlock(&s_writeMutex);
+
+        if (err == 0 || err == AT_ERROR_CHANNEL_CLOSED) {
             break;
         }
+    }
+
+    if (err == AT_ERROR_TIMEOUT && s_onTimeout != NULL) {
+        s_onTimeout();
     }
 
     if (err == 0) {
