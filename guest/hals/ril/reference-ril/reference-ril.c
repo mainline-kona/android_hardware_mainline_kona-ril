@@ -308,6 +308,8 @@ static RIL_RadioState currentState();
 static int onSupports (int requestCode);
 static void onCancel (RIL_Token t);
 static const char *getVersion();
+static void qmiVoiceEnsureIndReg(void);
+static volatile int s_qmiVoiceIndActive = 0;
 static int isRadioOn();
 static SIM_Status getSIMStatus();
 static int getCardStatus(RIL_CardStatus_v1_5 **pp_card_status);
@@ -1611,12 +1613,15 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
 
     at_response_free(p_response);
 
+    if (countValidCalls > 0) {
+        qmiVoiceEnsureIndReg();
+    }
+
 #ifdef POLL_CALL_STATE
-    if (countValidCalls) {  // We don't seem to get a "NO CARRIER" message from
-                            // smd, so we're forced to poll until the call ends.
+    if (countValidCalls && !s_qmiVoiceIndActive) {  // Event-driven QMI Voice 0x002E replaces 500ms polling when active
 #else
-    // This modem sends no "NO CARRIER" on our port either, so keep polling during calls.
-    if (needRepoll || countValidCalls) {
+    // Only poll during transient call states (dialing/alerting/incoming) or if QMI Voice ind is unavailable.
+    if (needRepoll || (countValidCalls && !s_qmiVoiceIndActive)) {
 #endif
         RIL_requestTimedCallback (sendCallStateChanged, NULL, &TIMEVAL_CALLSTATEPOLL);
     }
@@ -1754,6 +1759,11 @@ static int s_qmiUimFd = -1;
 static uint32_t s_qmiDmsNode = 0;
 static uint32_t s_qmiDmsPort = 0;
 static int s_qmiDmsResolved = 0;
+static uint32_t s_qmiVoiceNode = 0;
+static uint32_t s_qmiVoicePort = 0;
+static int s_qmiVoiceResolved = 0;
+static int s_qmiVoiceIndFd = -1;
+static int s_qmiVoiceIndThreadStarted = 0;
 static uint16_t s_qmiTxn = 1;
 
 /* Modem power-management state driven by Android sendDeviceState / setIndicationFilter */
@@ -1937,6 +1947,134 @@ static ssize_t qmiNasSendRecv(uint16_t msg_id, const uint8_t *tlvs, size_t tlv_l
         qmiResetNas();
     }
     return n;
+}
+
+static int qmiNasSetEndcConfig(bool enable)
+{
+    /* Verified on SDX55: QMI_NAS_SET_ENDC_CONFIG (0x00E7), mandatory TLV 0x01 = uint8 enable */
+    uint8_t tlvs[4] = { 0x01, 0x01, 0x00, enable ? 1 : 0 };
+    uint8_t resp[128];
+    uint16_t qerr = 0;
+    ssize_t n = qmiNasSendRecv(0x00E7, tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
+    if (n < 7) {
+        RLOGW("QMI NAS SetEndcConfig(enable=%d) no response", enable ? 1 : 0);
+        return -1;
+    }
+    if (qmiCheckResultTlv(resp, (size_t)n, &qerr) != 0) {
+        RLOGW("QMI NAS SetEndcConfig(enable=%d) failed err=0x%04x", enable ? 1 : 0, qerr);
+        return -1;
+    }
+    RLOGI("QMI NAS SetEndcConfig(enable=%d) OK", enable ? 1 : 0);
+    return 0;
+}
+
+static int qmiNasGetEndcConfig(bool *enabled_out)
+{
+    /* Verified on SDX55: QMI_NAS_GET_ENDC_CONFIG (0x00E8), output TLV 0x10 = uint8 enabled */
+    uint8_t resp[128];
+    uint16_t qerr = 0;
+    ssize_t n = qmiNasSendRecv(0x00E8, NULL, 0, resp, sizeof(resp), 2000);
+    if (n < 7 || qmiCheckResultTlv(resp, (size_t)n, &qerr) != 0) {
+        return -1;
+    }
+    size_t pos = 7;
+    while (pos + 3 <= (size_t)n) {
+        uint8_t t = resp[pos];
+        uint16_t l = (uint16_t)(resp[pos + 1] | (resp[pos + 2] << 8));
+        pos += 3;
+        if (pos + l > (size_t)n) break;
+        if (t == 0x10 && l >= 1) {
+            if (enabled_out) *enabled_out = (resp[pos] != 0);
+            return 0;
+        }
+        pos += l;
+    }
+    return -1;
+}
+
+static void *qmiVoiceIndLoop(void *param __unused)
+{
+    uint8_t buf[512];
+    for (;;) {
+        if (s_qmiVoiceIndFd < 0) {
+            usleep(500000);
+            continue;
+        }
+        struct pollfd pfd = { .fd = s_qmiVoiceIndFd, .events = POLLIN };
+        int pr = poll(&pfd, 1, -1);
+        if (pr <= 0) {
+            if (pr < 0 && errno != EINTR) usleep(100000);
+            continue;
+        }
+        ssize_t n = recv(s_qmiVoiceIndFd, buf, sizeof(buf), 0);
+        if (n < 7) continue;
+
+        uint8_t flags = buf[0];
+        uint16_t msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
+
+        if (flags == 0x02 && msg_id == 0x0003 /* QMI_VOICE_INDICATION_REGISTER resp */) {
+            uint16_t qerr = 0;
+            if (qmiCheckResultTlv(buf, (size_t)n, &qerr) == 0) {
+                s_qmiVoiceIndActive = 1;
+                RLOGI("QMI Voice IndicationRegister(CallNotif=1) OK");
+            } else {
+                s_qmiVoiceIndActive = 0;
+                RLOGW("QMI Voice IndicationRegister failed err=0x%04x", qerr);
+            }
+            continue;
+        }
+
+        if (flags == 0x04 && msg_id == 0x002E /* QMI_VOICE_ALL_CALL_STATUS_IND */) {
+            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED, NULL, 0);
+        }
+    }
+    return NULL;
+}
+
+static void qmiVoiceEnsureIndReg(void)
+{
+    if (s_qmiVoiceIndActive) return;
+
+    if (!s_qmiVoiceResolved) {
+        if (qmiLookupService(9 /* QMI_SERVICE_VOICE */, &s_qmiVoiceNode, &s_qmiVoicePort) < 0) {
+            return;
+        }
+        s_qmiVoiceResolved = 1;
+        RLOGI("QMI Voice resolved at QRTR node=%u port=%u", s_qmiVoiceNode, s_qmiVoicePort);
+    }
+    if (s_qmiVoiceIndFd < 0) {
+        s_qmiVoiceIndFd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s_qmiVoiceIndFd < 0) return;
+    }
+    if (!s_qmiVoiceIndThreadStarted) {
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &attr, qmiVoiceIndLoop, NULL) == 0) {
+            s_qmiVoiceIndThreadStarted = 1;
+        }
+        pthread_attr_destroy(&attr);
+    }
+
+    /* QMI_VOICE_INDICATION_REGISTER (0x0003), TLV 0x13 = Call Notification Events (1) */
+    uint16_t txn = s_qmiTxn++;
+    if (s_qmiTxn == 0) s_qmiTxn = 1;
+    uint8_t pkt[11] = {
+        0x00,
+        (uint8_t)(txn & 0xff), (uint8_t)((txn >> 8) & 0xff),
+        0x03, 0x00,
+        0x04, 0x00,
+        0x13, 0x01, 0x00, 0x01
+    };
+    struct sockaddr_qrtr dst = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = s_qmiVoiceNode,
+        .sq_port = s_qmiVoicePort,
+    };
+    if (sendto(s_qmiVoiceIndFd, pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        RLOGW("QMI Voice IndicationRegister send failed: %d", errno);
+    }
 }
 
 static void qmiResetUim(void)
@@ -7450,19 +7588,29 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_GET_ALLOWED_NETWORK_TYPES_BITMAP:
             requestGetPreferredNetworkType(request, data, datalen, t);
             break;
-        case RIL_REQUEST_ENABLE_NR_DUAL_CONNECTIVITY:
+        case RIL_REQUEST_ENABLE_NR_DUAL_CONNECTIVITY: {
             if (data == NULL || datalen != sizeof(int)) {
                 RIL_onRequestComplete(t, RIL_E_INTERNAL_ERR, NULL, 0);
                 break;
             }
             int nrDualConnectivityState = *(int *)(data);
-            isNrDualConnectivityEnabled = (nrDualConnectivityState == 1) ? true : false;
+            bool enableEndc = (nrDualConnectivityState == 1);
+            isNrDualConnectivityEnabled = enableEndc;
+            if (sState == RADIO_STATE_ON) {
+                qmiNasSetEndcConfig(enableEndc);
+            }
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-        case RIL_REQUEST_IS_NR_DUAL_CONNECTIVITY_ENABLED:
+        }
+        case RIL_REQUEST_IS_NR_DUAL_CONNECTIVITY_ENABLED: {
+            bool enabled = isNrDualConnectivityEnabled;
+            if (sState == RADIO_STATE_ON && qmiNasGetEndcConfig(&enabled) == 0) {
+                isNrDualConnectivityEnabled = enabled;
+            }
             RIL_onRequestComplete(t, RIL_E_SUCCESS, &isNrDualConnectivityEnabled,
                     sizeof(isNrDualConnectivityEnabled));
             break;
+        }
         case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE_BITMAP:
             requestGetPreferredNetworkType(request, data, datalen, t);
             break;

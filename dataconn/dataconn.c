@@ -581,14 +581,18 @@ int main(int argc, char **argv) {
             QmiWdaLinkLayerProtocol llp = QMI_WDA_LINK_LAYER_PROTOCOL_UNKNOWN;
             QmiWdaDataAggregationProtocol ul = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
             QmiWdaDataAggregationProtocol dl = QMI_WDA_DATA_AGGREGATION_PROTOCOL_DISABLED;
+            guint32 dl_max_size = 0;
             qmi_message_wda_get_data_format_output_get_link_layer_protocol(gout, &llp, NULL);
             qmi_message_wda_get_data_format_output_get_uplink_data_aggregation_protocol(gout, &ul,
                                                                                         NULL);
             qmi_message_wda_get_data_format_output_get_downlink_data_aggregation_protocol(gout, &dl,
                                                                                           NULL);
+            qmi_message_wda_get_data_format_output_get_downlink_data_aggregation_max_size(
+                    gout, &dl_max_size, NULL);
             if (llp == QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP &&
                 ul == QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5 &&
-                dl == QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5) {
+                dl == QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5 &&
+                dl_max_size > 0 && dl_max_size <= 31744) {
                 need_set = FALSE;
             }
         } else {
@@ -604,7 +608,8 @@ int main(int argc, char **argv) {
                     in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
             qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_protocol(
                     in, QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5, NULL);
-            qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_size(in, 32768,
+            /* Match mhi_oneplus_sdx55_info.mru_default (31744 B = order-3 32 KiB slab) */
+            qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_size(in, 31744,
                                                                                          NULL);
             qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_datagrams(
                     in, 32, NULL);
