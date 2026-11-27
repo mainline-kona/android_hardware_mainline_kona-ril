@@ -487,6 +487,10 @@ static void print_ipv6_pcscf(QmiDevice *dev, QmiClient *wds6, Wait *w) {
 }
 
 int main(int argc, char **argv) {
+    /* Ignore power-state signals during startup (and permanently for IMS PDNs) */
+    signal(SIGUSR2, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+
     GError *error = NULL;
     Wait w = {.loop = g_main_loop_new(NULL, FALSE)};
     const char *apn = argc > 1 ? argv[1] : "";
@@ -873,6 +877,10 @@ int main(int argc, char **argv) {
         g_unix_signal_add(SIGUSR2, on_sigusr2_low_data, &dormancy);
         g_unix_signal_add(SIGHUP, on_sighup_active, &dormancy);
         dormancy_reschedule(&dormancy, 15);
+    } else {
+        /* Ignore power-state signals on IMS PDN so rild broadcast never kills it */
+        signal(SIGUSR2, SIG_IGN);
+        signal(SIGHUP, SIG_IGN);
     }
 
     if (wds4) g_signal_connect(wds4, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);

@@ -1764,10 +1764,6 @@ static int s_unsolFilter = RIL_UR_SIGNAL_STRENGTH | RIL_UR_FULL_NETWORK_STATE |
                            RIL_UR_DATA_CALL_DORMANCY_CHANGED;
 static int s_locationUpdates = 1;
 static int32_t s_sigHysteresisDb = 3; /* default 3 dB delta (30 * 0.1 dB in QMI 0x006C) */
-static int16_t s_lteRsrpThresholds[8] = { -1280, -1180, -1080, -980, -880 };
-static int s_lteRsrpThresholdCount = 5;
-static int16_t s_nrRsrpThresholds[8] = { -1280, -1180, -1080, -980, -880 };
-static int s_nrRsrpThresholdCount = 5;
 
 static int qmiLookupService(uint32_t service, uint32_t *out_node, uint32_t *out_port)
 {
@@ -2918,6 +2914,11 @@ static int qmiNasSendConfigSigInfo2(int enable)
 
     uint8_t tlvs[128];
     size_t off = 0;
+    /*
+     * QMI_NAS_CONFIG_SIGNAL_INFO_V2 (0x006C) rejects Threshold List + Delta
+     * together for the same RAT with QMI_ERR_INVALID_ARG (0x0030).
+     * Use Delta TLVs cleanly (0.1 dB units; 0 disables indications).
+     */
     uint16_t delta_tenth_db = enable ? (uint16_t)(s_sigHysteresisDb * 10) : 0;
 
     /* TLV 0x1D: GSM RSSI Delta (0.1 dB; 0 = disabled) */
@@ -2928,38 +2929,10 @@ static int qmiNasSendConfigSigInfo2(int enable)
     tlvs[off++] = 0x1F; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
     tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
     tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    /* TLV 0x28: LTE RSRP Threshold List (0.1 dBm; count=0 disables) */
-    {
-        uint8_t cnt = enable ? (uint8_t)s_lteRsrpThresholdCount : 0;
-        uint16_t tlen = (uint16_t)(1 + cnt * 2);
-        tlvs[off++] = 0x28;
-        tlvs[off++] = (uint8_t)(tlen & 0xff);
-        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
-        tlvs[off++] = cnt;
-        for (uint8_t i = 0; i < cnt; i++) {
-            uint16_t v = (uint16_t)s_lteRsrpThresholds[i];
-            tlvs[off++] = (uint8_t)(v & 0xff);
-            tlvs[off++] = (uint8_t)((v >> 8) & 0xff);
-        }
-    }
     /* TLV 0x29: LTE RSRP Delta (0.1 dB; 0 = disabled) */
     tlvs[off++] = 0x29; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
     tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
     tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    /* TLV 0x35: NR5G RSRP Threshold List (0.1 dBm; count=0 disables) */
-    {
-        uint8_t cnt = enable ? (uint8_t)s_nrRsrpThresholdCount : 0;
-        uint16_t tlen = (uint16_t)(1 + cnt * 2);
-        tlvs[off++] = 0x35;
-        tlvs[off++] = (uint8_t)(tlen & 0xff);
-        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
-        tlvs[off++] = cnt;
-        for (uint8_t i = 0; i < cnt; i++) {
-            uint16_t v = (uint16_t)s_nrRsrpThresholds[i];
-            tlvs[off++] = (uint8_t)(v & 0xff);
-            tlvs[off++] = (uint8_t)((v >> 8) & 0xff);
-        }
-    }
     /* TLV 0x36: NR5G RSRP Delta (0.1 dB; 0 = disabled) */
     tlvs[off++] = 0x36; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
     tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
@@ -5534,24 +5507,10 @@ static void requestSetSignalStrengthCriteria(void *data, size_t datalen, RIL_Tok
     if (data && datalen >= sizeof(RIL_SignalStrengthReportingCriteria_v1_5)) {
         const RIL_SignalStrengthReportingCriteria_v1_5 *c =
                 (const RIL_SignalStrengthReportingCriteria_v1_5 *)data;
-        if (c->hysteresisDb >= 2 && c->hysteresisDb <= 9) {
+        if (c->hysteresisDb >= 2 && c->hysteresisDb <= 9 && c->hysteresisDb != s_sigHysteresisDb) {
             s_sigHysteresisDb = c->hysteresisDb;
+            applyModemPowerPolicy(1);
         }
-        if (c->isEnabled && c->thresholdsDbm && c->thresholdsDbmNumber > 0) {
-            int cnt = c->thresholdsDbmNumber > 8 ? 8 : c->thresholdsDbmNumber;
-            if (c->accessNetwork == RADIO_ACCESS_NET_EUTRAN) {
-                for (int i = 0; i < cnt; i++) {
-                    s_lteRsrpThresholds[i] = (int16_t)(c->thresholdsDbm[i] * 10);
-                }
-                s_lteRsrpThresholdCount = cnt;
-            } else if (c->accessNetwork == RADIO_ACCESS_NET_NGRAN) {
-                for (int i = 0; i < cnt; i++) {
-                    s_nrRsrpThresholds[i] = (int16_t)(c->thresholdsDbm[i] * 10);
-                }
-                s_nrRsrpThresholdCount = cnt;
-            }
-        }
-        applyModemPowerPolicy(1);
     }
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
