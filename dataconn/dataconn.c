@@ -57,6 +57,111 @@ static void fail(const char *what, GError *error) {
     exit(1);
 }
 
+static guint64 read_sysfs_u64(const char *path) {
+    g_autofree gchar *contents = NULL;
+    if (!g_file_get_contents(path, &contents, NULL, NULL)) return 0;
+    return (guint64)g_ascii_strtoull(contents, NULL, 10);
+}
+
+static guint64 read_iface_bytes(const char *ifname) {
+    char rx_path[128], tx_path[128];
+    snprintf(rx_path, sizeof(rx_path), "/sys/class/net/%s/statistics/rx_bytes", ifname);
+    snprintf(tx_path, sizeof(tx_path), "/sys/class/net/%s/statistics/tx_bytes", ifname);
+    return read_sysfs_u64(rx_path) + read_sysfs_u64(tx_path);
+}
+
+typedef struct {
+    QmiClient *wds;
+    const char *ifname;
+    const char *parent;
+    gboolean low_data;
+    gboolean had_traffic;
+    gboolean dormant_sent;
+    guint idle_secs;
+    guint interval_secs;
+    guint timer_id;
+    guint64 last_if_bytes;
+    guint64 last_parent_bytes;
+} DormancyCtx;
+
+static void on_go_dormant_done(GObject *source, GAsyncResult *res, gpointer data) {
+    (void)data;
+    GError *error = NULL;
+    g_autoptr(QmiMessageWdsGoDormantOutput) out =
+            qmi_client_wds_go_dormant_finish(QMI_CLIENT_WDS(source), res, &error);
+    if (!out || !qmi_message_wds_go_dormant_output_get_result(out, &error)) {
+        g_clear_error(&error);
+    }
+}
+
+static gboolean on_dormancy_tick(gpointer data);
+
+static void dormancy_reschedule(DormancyCtx *dc, guint secs) {
+    if (dc->timer_id) {
+        g_source_remove(dc->timer_id);
+        dc->timer_id = 0;
+    }
+    dc->interval_secs = secs;
+    dc->timer_id = g_timeout_add_seconds(secs, on_dormancy_tick, dc);
+}
+
+static gboolean on_dormancy_tick(gpointer data) {
+    DormancyCtx *dc = data;
+    guint64 if_bytes = read_iface_bytes(dc->ifname);
+    guint64 parent_bytes = read_iface_bytes(dc->parent);
+
+    if (if_bytes != dc->last_if_bytes || parent_bytes != dc->last_parent_bytes) {
+        dc->last_if_bytes = if_bytes;
+        dc->last_parent_bytes = parent_bytes;
+        dc->idle_secs = 0;
+        dc->had_traffic = TRUE;
+        dc->dormant_sent = FALSE;
+        if (dc->interval_secs != 3) {
+            dormancy_reschedule(dc, 3);
+            return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+    }
+
+    if (dc->had_traffic && !dc->dormant_sent && dc->wds) {
+        dc->idle_secs += dc->interval_secs;
+        guint threshold = dc->low_data ? 3 : 15;
+        if (dc->idle_secs >= threshold) {
+            dc->dormant_sent = TRUE;
+            dc->had_traffic = FALSE;
+            dc->idle_secs = 0;
+            qmi_client_wds_go_dormant(QMI_CLIENT_WDS(dc->wds), NULL, 5, NULL,
+                                      on_go_dormant_done, NULL);
+            /* Back off sysfs check while already dormant to avoid idle CPU wakes */
+            dormancy_reschedule(dc, 15);
+            return G_SOURCE_REMOVE;
+        }
+    } else if (dc->interval_secs != 15) {
+        dormancy_reschedule(dc, 15);
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean on_sigusr2_low_data(gpointer data) {
+    DormancyCtx *dc = data;
+    dc->low_data = TRUE;
+    if (!dc->dormant_sent) {
+        dc->had_traffic = TRUE;
+        dc->idle_secs = 0;
+        dormancy_reschedule(dc, 3);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean on_sighup_active(gpointer data) {
+    DormancyCtx *dc = data;
+    dc->low_data = FALSE;
+    dc->idle_secs = 0;
+    return G_SOURCE_CONTINUE;
+}
+
 static guint read_sysfs_uint(const char *path) {
     g_autofree gchar *contents = NULL;
     if (!g_file_get_contents(path, &contents, NULL, NULL)) return 0;
@@ -499,6 +604,11 @@ int main(int argc, char **argv) {
                                                                                          NULL);
             qmi_message_wda_set_data_format_input_set_downlink_data_aggregation_max_datagrams(
                     in, 32, NULL);
+            /* Match stock fusion_sda865_sdx55 netmgr_config.xml UL QMAPv5 aggregation */
+            qmi_message_wda_set_data_format_input_set_uplink_data_aggregation_max_size(in, 16384,
+                                                                                       NULL);
+            qmi_message_wda_set_data_format_input_set_uplink_data_aggregation_max_datagrams(
+                    in, 32, NULL);
             qmi_message_wda_set_data_format_input_set_endpoint_info(in, ep_type, ep_index, NULL);
             qmi_client_wda_set_data_format(QMI_CLIENT_WDA(wda), in, 10, NULL, on_done, &w);
             g_autoptr(QmiMessageWdaSetDataFormatOutput) out =
@@ -745,9 +855,33 @@ int main(int argc, char **argv) {
     g_unix_signal_add(SIGTERM, on_sigterm, w.loop);
     g_unix_signal_add(SIGINT, on_sigterm, w.loop);
     g_unix_signal_add(SIGUSR1, on_sigusr1, w.loop);
+
+    DormancyCtx dormancy = {
+        .wds = wds6 ? wds6 : wds4,
+        .ifname = ifname,
+        .parent = parent,
+        .low_data = FALSE,
+        .had_traffic = TRUE,
+        .dormant_sent = FALSE,
+        .idle_secs = 0,
+        .interval_secs = 15,
+        .timer_id = 0,
+        .last_if_bytes = read_iface_bytes(ifname),
+        .last_parent_bytes = read_iface_bytes(parent),
+    };
+    if (strcasecmp(apn, "ims") != 0 && dormancy.wds) {
+        g_unix_signal_add(SIGUSR2, on_sigusr2_low_data, &dormancy);
+        g_unix_signal_add(SIGHUP, on_sighup_active, &dormancy);
+        dormancy_reschedule(&dormancy, 15);
+    }
+
     if (wds4) g_signal_connect(wds4, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);
     if (wds6) g_signal_connect(wds6, "packet-service-status", G_CALLBACK(on_packet_service_status), w.loop);
     g_main_loop_run(w.loop);
+    if (dormancy.timer_id) {
+        g_source_remove(dormancy.timer_id);
+        dormancy.timer_id = 0;
+    }
 
     if (!s_disconnected && !s_handover) {
         if (handle4 && wds4) {

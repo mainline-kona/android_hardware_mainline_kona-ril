@@ -47,6 +47,7 @@
 #include <linux/vm_sockets.h>
 #include <arpa/inet.h>
 #include <limits.h>
+#include <poll.h>
 
 #ifndef AF_QIPCRTR
 #define AF_QIPCRTR 42
@@ -687,6 +688,8 @@ static RIL_Errno setInterfaceState(const char* interfaceName,
     return RIL_E_SUCCESS;
 }
 
+static int s_currentRegUrcMode = -1;
+
 /**
  * Arm unsolicited network registration URCs with full location/AcT info (<n>=2).
  * SDX55 resets +CREG/+CGREG/+CEREG/+C5GREG reporting mode back to 0 across
@@ -726,6 +729,7 @@ static void enableNetworkRegistrationUrks(void)
     at_response_free(p_response);
 
     at_send_command("AT+CGEREP=1,0", NULL);
+    s_currentRegUrcMode = 2;
 }
 
 static void qmiDisableModemIms(void);
@@ -1737,6 +1741,12 @@ static void initEmptySignalStrength(RIL_SignalStrength_v12 *ss)
 static uint32_t s_qmiNasNode = 0;
 static uint32_t s_qmiNasPort = 0;
 static int s_qmiNasResolved = 0;
+static int s_qmiNasFd = -1;
+static int s_qmiNasIndFd = -1;
+static int s_qmiNasIndThreadStarted = 0;
+static volatile int s_qmiNasSigIndActive = 0;
+static volatile int s_qmiNasSigIndFailed = 0;
+static int s_qmiNasSigEnabled = 0;
 static uint32_t s_qmiUimNode = 0;
 static uint32_t s_qmiUimPort = 0;
 static int s_qmiUimResolved = 0;
@@ -1745,6 +1755,19 @@ static uint32_t s_qmiDmsNode = 0;
 static uint32_t s_qmiDmsPort = 0;
 static int s_qmiDmsResolved = 0;
 static uint16_t s_qmiTxn = 1;
+
+/* Modem power-management state driven by Android sendDeviceState / setIndicationFilter */
+static int s_lowDataExpected = 0;
+static int s_powerSaveMode = 0;
+static int s_chargingState = 0;
+static int s_unsolFilter = RIL_UR_SIGNAL_STRENGTH | RIL_UR_FULL_NETWORK_STATE |
+                           RIL_UR_DATA_CALL_DORMANCY_CHANGED;
+static int s_locationUpdates = 1;
+static int32_t s_sigHysteresisDb = 3; /* default 3 dB delta (30 * 0.1 dB in QMI 0x006C) */
+static int16_t s_lteRsrpThresholds[8] = { -1280, -1180, -1080, -980, -880 };
+static int s_lteRsrpThresholdCount = 5;
+static int16_t s_nrRsrpThresholds[8] = { -1280, -1180, -1080, -980, -880 };
+static int s_nrRsrpThresholdCount = 5;
 
 static int qmiLookupService(uint32_t service, uint32_t *out_node, uint32_t *out_port)
 {
@@ -1881,6 +1904,15 @@ static int qmiCheckResultTlv(const uint8_t *buf, size_t len, uint16_t *err_out)
     return -1;
 }
 
+static void qmiResetNas(void)
+{
+    if (s_qmiNasFd >= 0) {
+        close(s_qmiNasFd);
+        s_qmiNasFd = -1;
+    }
+    s_qmiNasResolved = 0;
+}
+
 static int qmiEnsureNas(void)
 {
     if (!s_qmiNasResolved) {
@@ -1890,7 +1922,25 @@ static int qmiEnsureNas(void)
         s_qmiNasResolved = 1;
         RLOGI("QMI NAS resolved at QRTR node=%u port=%u", s_qmiNasNode, s_qmiNasPort);
     }
+    if (s_qmiNasFd < 0) {
+        s_qmiNasFd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s_qmiNasFd < 0) {
+            return -1;
+        }
+    }
     return 0;
+}
+
+static ssize_t qmiNasSendRecv(uint16_t msg_id, const uint8_t *tlvs, size_t tlv_len,
+                              uint8_t *resp, size_t resp_cap, int timeout_ms)
+{
+    if (qmiEnsureNas() < 0) return -1;
+    ssize_t n = qmiSendRecvFd(s_qmiNasFd, s_qmiNasNode, s_qmiNasPort,
+                              msg_id, tlvs, tlv_len, resp, resp_cap, timeout_ms);
+    if (n < 0) {
+        qmiResetNas();
+    }
+    return n;
 }
 
 static void qmiResetUim(void)
@@ -2246,8 +2296,8 @@ static int qmiNasSendSysSelPref(uint16_t mode_pref, const uint8_t *acq, uint8_t 
     }
 
     uint8_t resp[256];
-    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033 /* SetSystemSelectionPreference */,
-                            tlvs, off, resp, sizeof(resp), 2000);
+    ssize_t n = qmiNasSendRecv(0x0033 /* SetSystemSelectionPreference */,
+                               tlvs, off, resp, sizeof(resp), 2000);
     uint16_t qerr = 0;
     if (n < 0 || qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
         /* Fallback to minimal Mode Preference + Change Duration TLVs if extended TLVs were rejected */
@@ -2255,10 +2305,8 @@ static int qmiNasSendSysSelPref(uint16_t mode_pref, const uint8_t *acq, uint8_t 
             0x11, 0x02, 0x00, (uint8_t)(mode_pref & 0xff), (uint8_t)((mode_pref >> 8) & 0xff),
             0x17, 0x01, 0x00, duration,
         };
-        n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x0033,
-                        min_tlvs, sizeof(min_tlvs), resp, sizeof(resp), 2000);
+        n = qmiNasSendRecv(0x0033, min_tlvs, sizeof(min_tlvs), resp, sizeof(resp), 2000);
         if (n < 0) {
-            s_qmiNasResolved = 0;
             return -1;
         }
         if (qmiCheckResultTlv(resp, (size_t)n, &qerr) < 0) {
@@ -2338,6 +2386,10 @@ static int qmiNasSetModePreference(int raf_bitmap)
     if (s_nrNudgeActive && mode_pref == s_pendingModePref) {
         RLOGI("QMI NAS SetSystemSelectionPreference bitmap=0x%x -> NR-nudge already in flight for 0x%04x",
               raf_bitmap, mode_pref);
+        return 0;
+    }
+
+    if (!s_nrNudgeActive && mode_pref == s_lastModePref) {
         return 0;
     }
 
@@ -2537,28 +2589,18 @@ static int qmiUimSendApdu(uint8_t ch, const uint8_t *apdu, size_t apdu_len,
 
 static int s_qmiSignalRatMismatch = 0;
 
-static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
+static int parseQmiNasSignalTlvs(const uint8_t *buf, size_t n, RIL_SignalStrength_v12 *ss)
 {
-    if (qmiEnsureNas() < 0) return -1;
-
-    uint8_t buf[512];
-    ssize_t n = qmiSendRecv(s_qmiNasNode, s_qmiNasPort, 0x004f /* GetSignalInfo */,
-                            NULL, 0, buf, sizeof(buf), 250);
-    if (n < 7) {
-        s_qmiNasResolved = 0;
-        return -1;
-    }
-
     initEmptySignalStrength(ss);
     int got_any = 0;
     int got_lte = 0;
     int got_nr = 0;
     size_t pos = 7;
-    while (pos + 3 <= (size_t)n) {
+    while (pos + 3 <= n) {
         uint8_t t = buf[pos];
         uint16_t l = (uint16_t)(buf[pos + 1] | (buf[pos + 2] << 8));
         pos += 3;
-        if (pos + l > (size_t)n) break;
+        if (pos + l > n) break;
 
         if (t == 0x12 && l >= 1) {
             /* GSM RSSI (dBm) */
@@ -2628,9 +2670,9 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
 
     /*
      * During 4G <-> 5G SA handovers SDX55 can briefly report both LTE (0x14)
-     * and NR (0x17) TLVs in GetSignalInfo. Keep only the serving RAT's entry
-     * (unless on EN-DC NSA where act == 13 uses both LTE anchor + NR) so
-     * Android does not oscillate between LTE and NR primary signal bars.
+     * and NR (0x17) TLVs in GetSignalInfo/SignalInfoInd. Keep only the serving
+     * RAT's entry (unless on EN-DC NSA where act == 13 uses both LTE anchor + NR)
+     * so Android does not oscillate between LTE and NR primary signal bars.
      */
     if (got_lte && got_nr && s_lastRegAct != 13) {
         if (s_lastRegTech == RADIO_TECH_NR) {
@@ -2652,10 +2694,8 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
 
     /*
      * SDX55 can silently reselect between 4G LTE and 5G NR SA without emitting
-     * an AT +CEREG/+C5GREG URC, leaving ServiceState stale on the old RAT while
-     * SignalStrength only carries the new RAT (causing QNS to see INT_MAX for
-     * the old RAT and block IWLAN <-> cellular handovers). Flag unambiguous
-     * mismatches so pollSignalStrength triggers a registration refresh.
+     * an AT +CEREG/+C5GREG URC. Flag unambiguous RAT mismatches so callers can
+     * trigger a registration refresh.
      */
     s_qmiSignalRatMismatch = 0;
     if (s_lastRegAct != 13 && s_lastRegTech != RADIO_TECH_UNKNOWN) {
@@ -2666,6 +2706,18 @@ static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
     }
 
     return got_any ? 0 : -1;
+}
+
+static int readQmiNasSignalStrength(RIL_SignalStrength_v12 *ss)
+{
+    uint8_t buf[512];
+    ssize_t n = qmiNasSendRecv(0x004f /* GetSignalInfo */,
+                               NULL, 0, buf, sizeof(buf), 250);
+    if (n < 7) {
+        return -1;
+    }
+
+    return parseQmiNasSignalTlvs(buf, (size_t)n, ss);
 }
 
 // Fills a RIL_SignalStrength_v12-sized int array from QMI NAS (preferred for LTE/5G NR)
@@ -2747,16 +2799,23 @@ static void requestSignalStrength(void *data __unused, size_t datalen __unused, 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
 }
 
-// A real modem never reports +CSQ on its own, so push signal strength periodically
-static const struct timeval TIMEVAL_SIGNALPOLL = {3, 0};
+/*
+ * Event-driven QMI NAS signal strength reporting (QMI_NAS_CONFIG_SIGNAL_INFO_V2
+ * 0x006C + QMI_INDICATION_NAS_SIGNAL_INFO 0x0051) on a persistent QRTR socket.
+ * Replaces the legacy 3-second polling loop that woke SDX55 out of M3/D3hot
+ * continuously. Falls back to a slow 30 s screen-on-only poll only if 0x006C
+ * is rejected by the modem.
+ */
+static const struct timeval TIMEVAL_SIGNALPOLL_FALLBACK = {30, 0};
 static int s_signalPollStarted = 0;
+static void pollSignalStrength(void *param);
 
 static void pushSignalStrengthOnce(void *param __unused)
 {
     int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
     int response[maxNumOfElements];
 
-    if (sState == RADIO_STATE_ON &&
+    if (sState == RADIO_STATE_ON && areUiccApplicationsEnabled &&
             readSignalStrength(response, maxNumOfElements) == 0) {
         memcpy(s_lastSignal, response, sizeof(response));
         s_lastSignalValid = 1;
@@ -2768,27 +2827,236 @@ static void notifyNetworkAndSignal(void *param __unused)
 {
     if (sState != RADIO_STATE_ON) return;
     RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
-    pushSignalStrengthOnce(NULL);
+    if (!s_lowDataExpected && (s_unsolFilter & RIL_UR_SIGNAL_STRENGTH)) {
+        pushSignalStrengthOnce(NULL);
+    }
+}
+
+static void *qmiNasIndLoop(void *param __unused)
+{
+    uint8_t buf[512];
+    for (;;) {
+        if (s_qmiNasIndFd < 0) {
+            usleep(500000);
+            continue;
+        }
+        struct pollfd pfd = { .fd = s_qmiNasIndFd, .events = POLLIN };
+        int pr = poll(&pfd, 1, -1);
+        if (pr <= 0) {
+            if (pr < 0 && errno != EINTR) usleep(100000);
+            continue;
+        }
+        ssize_t n = recv(s_qmiNasIndFd, buf, sizeof(buf), 0);
+        if (n < 7) continue;
+
+        uint8_t flags = buf[0];
+        uint16_t msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
+
+        if (flags == 0x02 && msg_id == 0x006C /* ConfigSignalInfoV2 resp */) {
+            uint16_t qerr = 0;
+            if (qmiCheckResultTlv(buf, (size_t)n, &qerr) == 0) {
+                s_qmiNasSigIndActive = s_qmiNasSigEnabled;
+                s_qmiNasSigIndFailed = 0;
+                RLOGI("QMI NAS ConfigSignalInfoV2(enable=%d) OK", s_qmiNasSigEnabled);
+            } else {
+                s_qmiNasSigIndActive = 0;
+                s_qmiNasSigIndFailed = 1;
+                RLOGW("QMI NAS ConfigSignalInfoV2 failed err=0x%04x; using screen-on fallback", qerr);
+                if (!s_signalPollStarted) {
+                    s_signalPollStarted = 1;
+                    RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL_FALLBACK);
+                }
+            }
+            continue;
+        }
+
+        if (flags == 0x04 && msg_id == 0x0051 /* SignalInfoInd */) {
+            if (sState != RADIO_STATE_ON || !areUiccApplicationsEnabled ||
+                s_lowDataExpected || !(s_unsolFilter & RIL_UR_SIGNAL_STRENGTH)) {
+                continue;
+            }
+            RIL_SignalStrength_v12 ss;
+            if (parseQmiNasSignalTlvs(buf, (size_t)n, &ss) == 0) {
+                int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
+                int response[maxNumOfElements];
+                memcpy(response, &ss, sizeof(ss));
+                if (s_qmiSignalRatMismatch) {
+                    s_qmiSignalRatMismatch = 0;
+                    RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,
+                                              NULL, 0);
+                }
+                if (!s_lastSignalValid || memcmp(s_lastSignal, response, sizeof(response)) != 0) {
+                    memcpy(s_lastSignal, response, sizeof(response));
+                    s_lastSignalValid = 1;
+                    RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response,
+                                              sizeof(response));
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static int qmiNasSendConfigSigInfo2(int enable)
+{
+    if (qmiEnsureNas() < 0) return -1;
+
+    if (s_qmiNasIndFd < 0) {
+        s_qmiNasIndFd = socket(AF_QIPCRTR, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (s_qmiNasIndFd < 0) return -1;
+    }
+    if (!s_qmiNasIndThreadStarted) {
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&th, &attr, qmiNasIndLoop, NULL) == 0) {
+            s_qmiNasIndThreadStarted = 1;
+        }
+        pthread_attr_destroy(&attr);
+    }
+
+    uint8_t tlvs[128];
+    size_t off = 0;
+    uint16_t delta_tenth_db = enable ? (uint16_t)(s_sigHysteresisDb * 10) : 0;
+
+    /* TLV 0x1D: GSM RSSI Delta (0.1 dB; 0 = disabled) */
+    tlvs[off++] = 0x1D; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+    /* TLV 0x1F: WCDMA RSSI Delta (0.1 dB; 0 = disabled) */
+    tlvs[off++] = 0x1F; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+    /* TLV 0x28: LTE RSRP Threshold List (0.1 dBm; count=0 disables) */
+    {
+        uint8_t cnt = enable ? (uint8_t)s_lteRsrpThresholdCount : 0;
+        uint16_t tlen = (uint16_t)(1 + cnt * 2);
+        tlvs[off++] = 0x28;
+        tlvs[off++] = (uint8_t)(tlen & 0xff);
+        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
+        tlvs[off++] = cnt;
+        for (uint8_t i = 0; i < cnt; i++) {
+            uint16_t v = (uint16_t)s_lteRsrpThresholds[i];
+            tlvs[off++] = (uint8_t)(v & 0xff);
+            tlvs[off++] = (uint8_t)((v >> 8) & 0xff);
+        }
+    }
+    /* TLV 0x29: LTE RSRP Delta (0.1 dB; 0 = disabled) */
+    tlvs[off++] = 0x29; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+    /* TLV 0x35: NR5G RSRP Threshold List (0.1 dBm; count=0 disables) */
+    {
+        uint8_t cnt = enable ? (uint8_t)s_nrRsrpThresholdCount : 0;
+        uint16_t tlen = (uint16_t)(1 + cnt * 2);
+        tlvs[off++] = 0x35;
+        tlvs[off++] = (uint8_t)(tlen & 0xff);
+        tlvs[off++] = (uint8_t)((tlen >> 8) & 0xff);
+        tlvs[off++] = cnt;
+        for (uint8_t i = 0; i < cnt; i++) {
+            uint16_t v = (uint16_t)s_nrRsrpThresholds[i];
+            tlvs[off++] = (uint8_t)(v & 0xff);
+            tlvs[off++] = (uint8_t)((v >> 8) & 0xff);
+        }
+    }
+    /* TLV 0x36: NR5G RSRP Delta (0.1 dB; 0 = disabled) */
+    tlvs[off++] = 0x36; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+
+    uint8_t pkt[256];
+    uint16_t txn = s_qmiTxn++;
+    if (s_qmiTxn == 0) s_qmiTxn = 1;
+    pkt[0] = 0x00;
+    pkt[1] = (uint8_t)(txn & 0xff);
+    pkt[2] = (uint8_t)((txn >> 8) & 0xff);
+    pkt[3] = 0x6C;
+    pkt[4] = 0x00;
+    pkt[5] = (uint8_t)(off & 0xff);
+    pkt[6] = (uint8_t)((off >> 8) & 0xff);
+    memcpy(pkt + 7, tlvs, off);
+
+    struct sockaddr_qrtr dst = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = s_qmiNasNode,
+        .sq_port = s_qmiNasPort,
+    };
+    s_qmiNasSigEnabled = enable;
+    if (sendto(s_qmiNasIndFd, pkt, 7 + off, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void notifyDataconnPowerState(int low_data)
+{
+    int sig = low_data ? SIGUSR2 : SIGHUP;
+    for (int i = 0; i < MAX_PDP; i++) {
+        if (s_sessions[i].pid > 0) {
+            kill(s_sessions[i].pid, sig);
+        }
+    }
+}
+
+static void applyModemPowerPolicy(int force_sig_reconfig)
+{
+    int want_full_reg = (!s_lowDataExpected &&
+                         (s_unsolFilter & RIL_UR_FULL_NETWORK_STATE) &&
+                         s_locationUpdates) ? 2 : 1;
+
+    if (sState == RADIO_STATE_ON && want_full_reg != s_currentRegUrcMode) {
+        if (want_full_reg == 1) {
+            at_send_command("AT+CEREG=1", NULL);
+            at_send_command("AT+C5GREG=1", NULL);
+            at_send_command("AT+CREG=1", NULL);
+            at_send_command("AT+CGREG=1", NULL);
+        } else {
+            at_send_command("AT+CEREG=2", NULL);
+            at_send_command("AT+C5GREG=2", NULL);
+            at_send_command("AT+CREG=2", NULL);
+            at_send_command("AT+CGREG=2", NULL);
+        }
+        s_currentRegUrcMode = want_full_reg;
+        RLOGI("Modem reg URC mode -> %d (lowData=%d filter=0x%x loc=%d)",
+              want_full_reg, s_lowDataExpected, s_unsolFilter, s_locationUpdates);
+    }
+
+    int want_sig = (sState == RADIO_STATE_ON && areUiccApplicationsEnabled &&
+                    !s_lowDataExpected && (s_unsolFilter & RIL_UR_SIGNAL_STRENGTH)) ? 1 : 0;
+    if (force_sig_reconfig || want_sig != s_qmiNasSigEnabled || !s_qmiNasIndThreadStarted) {
+        qmiNasSendConfigSigInfo2(want_sig);
+    }
+
+    notifyDataconnPowerState(s_lowDataExpected);
 }
 
 static void pollSignalStrength(void *param __unused)
 {
-    int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
-    int response[maxNumOfElements];
-
-    if (sState == RADIO_STATE_ON &&
-            readSignalStrength(response, maxNumOfElements) == 0) {
-        if (s_qmiSignalRatMismatch) {
-            s_qmiSignalRatMismatch = 0;
-            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+    /*
+     * Only poll as a slow screen-on fallback if QMI_NAS_CONFIG_SIGNAL_INFO_V2
+     * was rejected. When event-driven 0x0051 indications are active, or while
+     * screen-off/Doze/radio-off/SIM-disabled, do zero polling.
+     */
+    if (s_qmiNasSigIndFailed && sState == RADIO_STATE_ON && areUiccApplicationsEnabled &&
+        !s_lowDataExpected && (s_unsolFilter & RIL_UR_SIGNAL_STRENGTH)) {
+        int maxNumOfElements = sizeof(RIL_SignalStrength_v12) / sizeof(int);
+        int response[maxNumOfElements];
+        if (readSignalStrength(response, maxNumOfElements) == 0) {
+            if (s_qmiSignalRatMismatch) {
+                s_qmiSignalRatMismatch = 0;
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
+            }
+            if (!s_lastSignalValid || memcmp(s_lastSignal, response, sizeof(response)) != 0) {
+                memcpy(s_lastSignal, response, sizeof(response));
+                s_lastSignalValid = 1;
+                RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
+            }
         }
-        if (!s_lastSignalValid || memcmp(s_lastSignal, response, sizeof(response)) != 0) {
-            memcpy(s_lastSignal, response, sizeof(response));
-            s_lastSignalValid = 1;
-            RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, response, sizeof(response));
-        }
+        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL_FALLBACK);
+    } else {
+        s_signalPollStarted = 0;
     }
-    RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
 }
 
 /**
@@ -4964,18 +5232,49 @@ static void requestExitEmergencyMode(void *data __unused, size_t datalen __unuse
 }
 
 static uint64_t s_last_activity_info_query = 0;
+static uint64_t s_last_pci_susp_ms = 0;
+static uint64_t s_last_pci_act_ms = 0;
+static int s_last_pci_valid = 0;
+
+static int readSysfsU64(const char *path, uint64_t *out)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    unsigned long long v = 0;
+    int ok = (fscanf(f, "%llu", &v) == 1);
+    fclose(f);
+    if (!ok) return -1;
+    *out = (uint64_t)v;
+    return 0;
+}
 
 static void requestGetActivityInfo(void *data __unused, size_t datalen __unused, RIL_Token t)
 {
     uint64_t curTime = ril_nano_time();
-    RIL_ActivityStatsInfo stats =
-    {
-        0, // sleep_mode_time_ms
-        ((curTime - s_last_activity_info_query) / 1000000) - 1, // idle_mode_time_ms
-        {0, 0, 0, 0, 0}, // tx_mode_time_ms
-        0 // rx_mode_time_ms
-    };
+    uint64_t elapsed_ms = (s_last_activity_info_query > 0 && curTime > s_last_activity_info_query)
+            ? (curTime - s_last_activity_info_query) / 1000000ULL : 0;
     s_last_activity_info_query = curTime;
+
+    RIL_ActivityStatsInfo stats;
+    memset(&stats, 0, sizeof(stats));
+
+    uint64_t susp_ms = 0, act_ms = 0;
+    if (readSysfsU64("/sys/bus/pci/devices/0002:01:00.0/power/runtime_suspended_time", &susp_ms) == 0 &&
+        readSysfsU64("/sys/bus/pci/devices/0002:01:00.0/power/runtime_active_time", &act_ms) == 0) {
+        if (s_last_pci_valid && susp_ms >= s_last_pci_susp_ms && act_ms >= s_last_pci_act_ms) {
+            stats.sleep_mode_time_ms = (uint32_t)(susp_ms - s_last_pci_susp_ms);
+            stats.idle_mode_time_ms = (uint32_t)(act_ms - s_last_pci_act_ms);
+        } else {
+            stats.sleep_mode_time_ms = (uint32_t)elapsed_ms;
+        }
+        s_last_pci_susp_ms = susp_ms;
+        s_last_pci_act_ms = act_ms;
+        s_last_pci_valid = 1;
+    } else if (sState != RADIO_STATE_ON || s_lowDataExpected) {
+        stats.sleep_mode_time_ms = (uint32_t)elapsed_ms;
+    } else {
+        stats.idle_mode_time_ms = (uint32_t)elapsed_ms;
+    }
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &stats, sizeof(stats));
 }
@@ -5183,22 +5482,78 @@ static void requestSetMute(void *data, size_t datalen, RIL_Token t)
 static void requestScreenState(void *data, RIL_Token t)
 {
     int status = *((int *)data);
+    int prev_low = s_lowDataExpected;
+    s_lowDataExpected = !status;
 
-    if (!status) {
-        /* Suspend */
-        at_send_command("AT+CEREG=1", NULL);
-        at_send_command("AT+C5GREG=1", NULL);
-        at_send_command("AT+CREG=1", NULL);
-        at_send_command("AT+CGREG=1", NULL);
-    } else {
-       /* Resume */
-        at_send_command("AT+CEREG=2", NULL);
-        at_send_command("AT+C5GREG=2", NULL);
-        at_send_command("AT+CREG=2", NULL);
-        at_send_command("AT+CGREG=2", NULL);
+    applyModemPowerPolicy(0);
+    if (prev_low && !s_lowDataExpected && sState == RADIO_STATE_ON) {
+        pushSignalStrengthOnce(NULL);
+        if (s_qmiNasSigIndFailed && !s_signalPollStarted) {
+            s_signalPollStarted = 1;
+            RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL_FALLBACK);
+        }
     }
 
-   RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+}
+
+static void requestSendDeviceState(void *data, size_t datalen, RIL_Token t)
+{
+    if (!data || datalen < 2 * sizeof(int)) {
+        RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
+        return;
+    }
+    int type = ((int *)data)[0];
+    int state = ((int *)data)[1] ? 1 : 0;
+    int prev_low = s_lowDataExpected;
+
+    switch (type) {
+        case RIL_DST_LOW_DATA_EXPECTED:
+            s_lowDataExpected = state;
+            applyModemPowerPolicy(0);
+            if (prev_low && !s_lowDataExpected && sState == RADIO_STATE_ON) {
+                pushSignalStrengthOnce(NULL);
+            }
+            break;
+        case RIL_DST_POWER_SAVE_MODE:
+            s_powerSaveMode = state;
+            break;
+        case RIL_DST_CHARGING_STATE:
+            s_chargingState = state;
+            break;
+        default:
+            break;
+    }
+    RLOGI("sendDeviceState: type=%d state=%d (lowData=%d psm=%d chg=%d)",
+          type, state, s_lowDataExpected, s_powerSaveMode, s_chargingState);
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+}
+
+static void requestSetSignalStrengthCriteria(void *data, size_t datalen, RIL_Token t)
+{
+    if (data && datalen >= sizeof(RIL_SignalStrengthReportingCriteria_v1_5)) {
+        const RIL_SignalStrengthReportingCriteria_v1_5 *c =
+                (const RIL_SignalStrengthReportingCriteria_v1_5 *)data;
+        if (c->hysteresisDb >= 2 && c->hysteresisDb <= 9) {
+            s_sigHysteresisDb = c->hysteresisDb;
+        }
+        if (c->isEnabled && c->thresholdsDbm && c->thresholdsDbmNumber > 0) {
+            int cnt = c->thresholdsDbmNumber > 8 ? 8 : c->thresholdsDbmNumber;
+            if (c->accessNetwork == RADIO_ACCESS_NET_EUTRAN) {
+                for (int i = 0; i < cnt; i++) {
+                    s_lteRsrpThresholds[i] = (int16_t)(c->thresholdsDbm[i] * 10);
+                }
+                s_lteRsrpThresholdCount = cnt;
+            } else if (c->accessNetwork == RADIO_ACCESS_NET_NGRAN) {
+                for (int i = 0; i < cnt; i++) {
+                    s_nrRsrpThresholds[i] = (int16_t)(c->thresholdsDbm[i] * 10);
+                }
+                s_nrRsrpThresholdCount = cnt;
+            }
+        }
+        applyModemPowerPolicy(1);
+    }
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
 static void requestQueryClip(void *data, size_t datalen, RIL_Token t)
@@ -6025,15 +6380,17 @@ error:
 
 static void requestStartKeepalive(void* data, size_t datalen __unused, RIL_Token t) {
     RIL_KeepaliveRequest* kaRequest = (RIL_KeepaliveRequest*)data;
-    if (kaRequest->cid > MAX_PDP) {
+    if (!kaRequest || kaRequest->cid > MAX_PDP) {
         RLOGE("Invalid cid for keepalive!");
         RIL_onRequestComplete(t, RIL_E_INVALID_ARGUMENTS, NULL, 0);
         return;
     }
-    RIL_KeepaliveStatus resp;
-    resp.sessionHandle = __sync_fetch_and_add(&s_session_handle, 1);
-    resp.code = KEEPALIVE_ACTIVE;
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, &resp, sizeof(resp));
+    /*
+     * Do not claim KEEPALIVE_ACTIVE without programming SDX55 WDS modem-assisted
+     * keepalive; returning REQUEST_NOT_SUPPORTED lets ConnectivityService handle
+     * NAT-T keepalives honestly instead of letting mappings silently expire.
+     */
+    RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
 }
 
 void getConfigSlotStatus(RIL_SimSlotStatus_V1_2 *pSimSlotStatusList, int count) {
@@ -6368,6 +6725,7 @@ onRequestSlot2(int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_ALLOW_DATA:
         case RIL_REQUEST_SET_DATA_PROFILE:
         case RIL_REQUEST_SET_INITIAL_ATTACH_APN:
+        case RIL_REQUEST_SEND_DEVICE_STATE:
         case RIL_REQUEST_SCREEN_STATE:
         case RIL_REQUEST_SET_UNSOLICITED_RESPONSE_FILTER:
         case RIL_REQUEST_SET_SIGNAL_STRENGTH_REPORTING_CRITERIA:
@@ -6915,6 +7273,12 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SET_CARRIER_RESTRICTIONS:
         case RIL_REQUEST_GET_NEIGHBORING_CELL_IDS:
         case RIL_REQUEST_SET_LOCATION_UPDATES:
+            if (data && datalen >= sizeof(int)) {
+                s_locationUpdates = ((int *)data)[0] ? 1 : 0;
+                applyModemPowerPolicy(0);
+            }
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            break;
         case RIL_REQUEST_SET_TTY_MODE:
         case RIL_REQUEST_CDMA_SET_PREFERRED_VOICE_PRIVACY_MODE:
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -6987,6 +7351,10 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
         case RIL_REQUEST_GET_ACTIVITY_INFO:
             requestGetActivityInfo(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_SEND_DEVICE_STATE:
+            requestSendDeviceState(data, datalen, t);
             break;
 
         case RIL_REQUEST_SCREEN_STATE:
@@ -7090,9 +7458,18 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_EMERGENCY_DIAL:
             requestEccDial(data, t);
             break;
-        case RIL_REQUEST_SET_SIM_CARD_POWER:
+        case RIL_REQUEST_SET_SIM_CARD_POWER: {
+            if (data && datalen >= sizeof(int)) {
+                int powerState = ((int *)data)[0];
+                /* 0 = POWER_DOWN, 1 = POWER_UP, 2 = POWER_UP_PASS_THROUGH */
+                uint16_t msg_id = (powerState == 0) ? 0x0030 /* PowerOffSim */ : 0x0031 /* PowerOnSim */;
+                uint8_t tlvs[] = { 0x01, 0x01, 0x00, 0x01 }; /* Slot 1 */
+                uint8_t resp[128];
+                qmiUimSendRecv(msg_id, tlvs, sizeof(tlvs), resp, sizeof(resp), 2000);
+            }
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
+        }
         case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE_BITMAP:
             requestSetPreferredNetworkType(request, data, datalen, t);
             break;
@@ -7178,7 +7555,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             break;
         }
         case RIL_REQUEST_SET_SIGNAL_STRENGTH_REPORTING_CRITERIA:
-            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            requestSetSignalStrengthCriteria(data, datalen, t);
             break;
         case RIL_REQUEST_SET_LINK_CAPACITY_REPORTING_CRITERIA:
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -7207,6 +7584,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                     at_send_command("AT+COPS=2", NULL);
                     s_copsDeregistered = 1;
                 }
+                applyModemPowerPolicy(1);
                 RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
                 RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
             } else {
@@ -7215,6 +7593,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                     enableNetworkRegistrationUrks();
                     s_copsDeregistered = 0;
                     at_send_command("AT+COPS=0", NULL);
+                    applyModemPowerPolicy(1);
                     RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &TIMEVAL_RAT_SETTLE);
                     static const struct timeval settle_3s = {3, 500000};
                     RIL_requestTimedCallback(notifyNetworkAndSignal, NULL, &settle_3s);
@@ -7256,6 +7635,15 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             }
             break;
         case RIL_REQUEST_SET_UNSOLICITED_RESPONSE_FILTER:
+            if (data && datalen >= sizeof(int)) {
+                int prev_sig = (s_unsolFilter & RIL_UR_SIGNAL_STRENGTH);
+                s_unsolFilter = ((int *)data)[0];
+                applyModemPowerPolicy(0);
+                if (!prev_sig && (s_unsolFilter & RIL_UR_SIGNAL_STRENGTH) &&
+                    !s_lowDataExpected && sState == RADIO_STATE_ON) {
+                    pushSignalStrengthOnce(NULL);
+                }
+            }
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
         default:
@@ -8033,9 +8421,15 @@ static void initializeCallback(void *param __unused)
         setRadioState (RADIO_STATE_OFF);
     }
 
-    if (!s_signalPollStarted) {
+    /* Arm event-driven QMI NAS signal indications and sync power policy */
+    s_currentRegUrcMode = 2;
+    applyModemPowerPolicy(1);
+    if (sState == RADIO_STATE_ON && !s_lowDataExpected) {
+        pushSignalStrengthOnce(NULL);
+    }
+    if (!s_signalPollStarted && s_qmiNasSigIndFailed) {
         s_signalPollStarted = 1;
-        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL);
+        RIL_requestTimedCallback(pollSignalStrength, NULL, &TIMEVAL_SIGNALPOLL_FALLBACK);
     }
 }
 
@@ -8521,7 +8915,7 @@ mainLoop(void *param __unused)
                                          ANDROID_SOCKET_NAMESPACE_FILESYSTEM,
                                          SOCK_STREAM);
             } else if (s_device_path != NULL) {
-                fd = open (s_device_path, O_RDWR);
+                fd = open (s_device_path, O_RDWR | O_CLOEXEC);
                 if (fd < 0) {
                     RLOGD("Can't open %s: %s", s_device_path, strerror(errno));
                     sleep(1);

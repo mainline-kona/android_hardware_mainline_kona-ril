@@ -4098,6 +4098,9 @@ Return<void> RadioImpl_1_6::setSignalStrengthReportingCriteria_1_5(int32_t seria
     CALL_ONREQUEST(pRI->pCI->requestNumber, criteria,
             sizeof(RIL_SignalStrengthReportingCriteria_v1_5), pRI, mSlotId);
 
+    delete[] criteria->thresholdsDbm;
+    free(criteria);
+
     return Void();
 }
 
@@ -4145,6 +4148,10 @@ Return<void> RadioImpl_1_6::setLinkCapacityReportingCriteria_1_5(int32_t serial,
 
      CALL_ONREQUEST(pRI->pCI->requestNumber, criteria,
              sizeof(RIL_LinkCapacityReportingCriteria), pRI, pRI->socket_id);
+
+     delete[] criteria->thresholdsDownlinkKbps;
+     delete[] criteria->thresholdsUplinkKbps;
+     free(criteria);
 
      return Void();
 }
