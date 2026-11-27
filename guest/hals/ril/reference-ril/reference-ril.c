@@ -2986,6 +2986,21 @@ static void *qmiNasIndLoop(void *param __unused)
         uint8_t flags = buf[0];
         uint16_t msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
 
+        if (flags == 0x02 && msg_id == 0x0003 /* QMI_NAS_INDICATION_REGISTER resp */) {
+            uint16_t qerr = 0;
+            if (qmiCheckResultTlv(buf, (size_t)n, &qerr) == 0) {
+                if (!s_qmiNasSigEnabled) {
+                    s_qmiNasSigIndActive = 0;
+                    s_qmiNasSigIndFailed = 0;
+                }
+                RLOGI("QMI NAS IndicationRegister(sig_info=%d) OK", s_qmiNasSigEnabled);
+            } else {
+                RLOGW("QMI NAS IndicationRegister(sig_info=%d) failed err=0x%04x",
+                      s_qmiNasSigEnabled, qerr);
+            }
+            continue;
+        }
+
         if (flags == 0x02 && msg_id == 0x006C /* ConfigSignalInfoV2 resp */) {
             uint16_t qerr = 0;
             if (qmiCheckResultTlv(buf, (size_t)n, &qerr) == 0) {
@@ -3050,15 +3065,47 @@ static int qmiNasSendConfigSigInfo2(int enable)
         pthread_attr_destroy(&attr);
     }
 
+    struct sockaddr_qrtr dst = {
+        .sq_family = AF_QIPCRTR,
+        .sq_node = s_qmiNasNode,
+        .sq_port = s_qmiNasPort,
+    };
+    s_qmiNasSigEnabled = enable;
+
+    /*
+     * Verified live on SDX55:
+     * - QMI_NAS_INDICATION_REGISTER (0x0003) TLV 0x19 (Signal Info) cleanly
+     *   enables (1) or disables (0) unsolicited 0x0051 indications with
+     *   QMI_ERR_NONE (0x0000), whereas 0x006C rejects delta=0 (0x0030) and
+     *   0-length threshold lists (0x0008).
+     */
+    {
+        uint16_t reg_txn = s_qmiTxn++;
+        if (s_qmiTxn == 0) s_qmiTxn = 1;
+        uint8_t reg_pkt[11] = {
+            0x00,
+            (uint8_t)(reg_txn & 0xff), (uint8_t)((reg_txn >> 8) & 0xff),
+            0x03, 0x00,
+            0x04, 0x00,
+            0x19, 0x01, 0x00, (uint8_t)(enable ? 1 : 0)
+        };
+        if (sendto(s_qmiNasIndFd, reg_pkt, sizeof(reg_pkt), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+            return -1;
+        }
+        if (!enable) {
+            return 0;
+        }
+    }
+
     uint8_t tlvs[128];
     size_t off = 0;
     /*
      * QMI_NAS_CONFIG_SIGNAL_INFO_V2 (0x006C) rules on SDX55:
-     * - Threshold List and Delta are mutually exclusive per RAT (else 0x0030).
-     * - Delta = 0 is rejected with 0x0030; disabling uses 0-length Threshold
-     *   Lists (0x1C GSM, 0x1E WCDMA, 0x28 LTE RSRP, 0x35 NR5G RSRP).
+     * Threshold List and Delta are mutually exclusive per RAT (else 0x0030).
+     * Send Delta-only TLVs when enabling signal indications.
      */
-    if (enable) {
+    {
         uint16_t delta_tenth_db = (uint16_t)(s_sigHysteresisDb * 10);
         /* TLV 0x1D: GSM RSSI Delta (0.1 dB) */
         tlvs[off++] = 0x1D; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
@@ -3076,16 +3123,6 @@ static int qmiNasSendConfigSigInfo2(int enable)
         tlvs[off++] = 0x36; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
         tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
         tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    } else {
-        /* 0-length threshold lists cleanly disable 0x0051 indications per RAT */
-        static const uint8_t disable_tlvs[] = {
-            0x1C, 0x01, 0x00, 0x00, /* GSM RSSI Threshold List = empty */
-            0x1E, 0x01, 0x00, 0x00, /* WCDMA RSSI Threshold List = empty */
-            0x28, 0x01, 0x00, 0x00, /* LTE RSRP Threshold List = empty */
-            0x35, 0x01, 0x00, 0x00, /* NR5G RSRP Threshold List = empty */
-        };
-        memcpy(tlvs, disable_tlvs, sizeof(disable_tlvs));
-        off = sizeof(disable_tlvs);
     }
 
     uint8_t pkt[256];
@@ -3100,12 +3137,6 @@ static int qmiNasSendConfigSigInfo2(int enable)
     pkt[6] = (uint8_t)((off >> 8) & 0xff);
     memcpy(pkt + 7, tlvs, off);
 
-    struct sockaddr_qrtr dst = {
-        .sq_family = AF_QIPCRTR,
-        .sq_node = s_qmiNasNode,
-        .sq_port = s_qmiNasPort,
-    };
-    s_qmiNasSigEnabled = enable;
     if (sendto(s_qmiNasIndFd, pkt, 7 + off, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
         return -1;
     }
