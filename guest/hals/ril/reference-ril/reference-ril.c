@@ -2915,28 +2915,40 @@ static int qmiNasSendConfigSigInfo2(int enable)
     uint8_t tlvs[128];
     size_t off = 0;
     /*
-     * QMI_NAS_CONFIG_SIGNAL_INFO_V2 (0x006C) rejects Threshold List + Delta
-     * together for the same RAT with QMI_ERR_INVALID_ARG (0x0030).
-     * Use Delta TLVs cleanly (0.1 dB units; 0 disables indications).
+     * QMI_NAS_CONFIG_SIGNAL_INFO_V2 (0x006C) rules on SDX55:
+     * - Threshold List and Delta are mutually exclusive per RAT (else 0x0030).
+     * - Delta = 0 is rejected with 0x0030; disabling uses 0-length Threshold
+     *   Lists (0x1C GSM, 0x1E WCDMA, 0x28 LTE RSRP, 0x35 NR5G RSRP).
      */
-    uint16_t delta_tenth_db = enable ? (uint16_t)(s_sigHysteresisDb * 10) : 0;
-
-    /* TLV 0x1D: GSM RSSI Delta (0.1 dB; 0 = disabled) */
-    tlvs[off++] = 0x1D; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
-    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
-    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    /* TLV 0x1F: WCDMA RSSI Delta (0.1 dB; 0 = disabled) */
-    tlvs[off++] = 0x1F; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
-    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
-    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    /* TLV 0x29: LTE RSRP Delta (0.1 dB; 0 = disabled) */
-    tlvs[off++] = 0x29; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
-    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
-    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
-    /* TLV 0x36: NR5G RSRP Delta (0.1 dB; 0 = disabled) */
-    tlvs[off++] = 0x36; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
-    tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
-    tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+    if (enable) {
+        uint16_t delta_tenth_db = (uint16_t)(s_sigHysteresisDb * 10);
+        /* TLV 0x1D: GSM RSSI Delta (0.1 dB) */
+        tlvs[off++] = 0x1D; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+        tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+        tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+        /* TLV 0x1F: WCDMA RSSI Delta (0.1 dB) */
+        tlvs[off++] = 0x1F; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+        tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+        tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+        /* TLV 0x29: LTE RSRP Delta (0.1 dB) */
+        tlvs[off++] = 0x29; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+        tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+        tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+        /* TLV 0x36: NR5G RSRP Delta (0.1 dB) */
+        tlvs[off++] = 0x36; tlvs[off++] = 0x02; tlvs[off++] = 0x00;
+        tlvs[off++] = (uint8_t)(delta_tenth_db & 0xff);
+        tlvs[off++] = (uint8_t)((delta_tenth_db >> 8) & 0xff);
+    } else {
+        /* 0-length threshold lists cleanly disable 0x0051 indications per RAT */
+        static const uint8_t disable_tlvs[] = {
+            0x1C, 0x01, 0x00, 0x00, /* GSM RSSI Threshold List = empty */
+            0x1E, 0x01, 0x00, 0x00, /* WCDMA RSSI Threshold List = empty */
+            0x28, 0x01, 0x00, 0x00, /* LTE RSRP Threshold List = empty */
+            0x35, 0x01, 0x00, 0x00, /* NR5G RSRP Threshold List = empty */
+        };
+        memcpy(tlvs, disable_tlvs, sizeof(disable_tlvs));
+        off = sizeof(disable_tlvs);
+    }
 
     uint8_t pkt[256];
     uint16_t txn = s_qmiTxn++;
